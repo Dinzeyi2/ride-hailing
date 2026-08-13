@@ -127,6 +127,7 @@ ride-hailing/
 ## Documentation
 
 - [Quick Start Guide](docs/QUICKSTART.md)
+- [Railway Deployment (frontend-callable API)](docs/RAILWAY_DEPLOY.md)
 - [Development Guide](docs/DEVELOPMENT.md)
 - [API Reference](docs/API.md)
 - [Deployment](docs/DEPLOYMENT.md)
