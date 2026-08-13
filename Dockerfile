@@ -22,6 +22,12 @@ COPY . .
 # Build argument for service name
 ARG SERVICE_NAME
 
+# Fail fast with a clear message instead of the cryptic "no Go files in
+# /app/cmd" error you get from `go build ./cmd/` when SERVICE_NAME is unset
+# (e.g. a Railway service pointed at this Dockerfile without a build arg).
+RUN test -n "$SERVICE_NAME" || (echo "ERROR: SERVICE_NAME build arg is not set. Pass --build-arg SERVICE_NAME=<service> (e.g. auth, rides, geo, payments, mobile) or use one of the deploy/railway/<service>/Dockerfile files instead." >&2 && exit 1)
+RUN test -d "cmd/$SERVICE_NAME" || (echo "ERROR: cmd/$SERVICE_NAME does not exist. Check the SERVICE_NAME build arg." >&2 && exit 1)
+
 # Build the service
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o /app/service ./cmd/${SERVICE_NAME}
 

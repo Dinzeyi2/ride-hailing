@@ -136,6 +136,22 @@ serves your app from (including the preview-domain origin, if different from
 the published one) — the middleware does an exact string match, not a
 wildcard subdomain match.
 
+## Troubleshooting
+
+**Build fails with `no Go files in /app/cmd`** (or `RUN CGO_ENABLED=0 ... go
+build ... ./cmd/${SERVICE_NAME}` exits 1): this service's Railway build is
+using the **root** `Dockerfile`, which needs a `SERVICE_NAME` build arg
+(`auth`, `mobile`, `rides`, `geo`, or `payments`) to know which binary to
+build. With no arg it tries to build `./cmd/` itself, which has no Go files
+directly in it — hence the error. Fix by going to that service's **Settings
+→ Build → Dockerfile Path** and setting it to
+`deploy/railway/<name>/Dockerfile` (e.g. `deploy/railway/auth/Dockerfile`)
+as described in step 3 above, then redeploy. Those per-service Dockerfiles
+already hardcode the right `cmd/<service>` path, so no build arg is needed.
+(If you'd rather keep using the root `Dockerfile` for some reason, the fix
+is to add a build argument `SERVICE_NAME=<service>` in that same Settings →
+Build panel instead.)
+
 ## Known gaps in this minimal deploy
 
 - `mobile` calls out to `NOTIFICATIONS_SERVICE_URL` and
