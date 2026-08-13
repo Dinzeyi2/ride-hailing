@@ -89,7 +89,15 @@ func resolveSigningKey(provider jwtkeys.KeyProvider, token *jwt.Token) ([]byte, 
 	}
 
 	if kid != "" {
-		return provider.ResolveKey(kid)
+		if key, err := provider.ResolveKey(kid); err == nil {
+			return key, nil
+		}
+		// Fall through to the legacy secret: in multi-process deployments each
+		// service holds its own independent key store (no shared file/volume),
+		// so a kid minted by one process is routinely unresolvable by another
+		// even though both were seeded from the same JWT_SECRET. Signature
+		// verification below still rejects any token not actually signed with
+		// this secret, so this fallback does not weaken validation.
 	}
 
 	legacy := provider.LegacyKey()

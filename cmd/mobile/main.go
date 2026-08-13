@@ -365,6 +365,7 @@ func main() {
 	router.Use(middleware.SentryMiddleware())   // Sentry integration
 	router.Use(middleware.CorrelationID())
 	router.Use(middleware.RequestTimeout(&cfg.Timeout))
+	router.Use(middleware.CORS())
 	router.Use(middleware.SecurityHeaders())
 	router.Use(middleware.MaxBodySize(10 << 20)) // 10MB request body limit
 	router.Use(middleware.SanitizeRequest())
