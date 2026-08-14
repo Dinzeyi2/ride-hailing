@@ -1,7 +1,8 @@
 # Deploying to Railway
 
-This guide deploys a **core subset** of the platform to Railway so a frontend
-(e.g. a Lovable.dev app) can call it directly over HTTPS:
+This guide deploys the frontend-facing **core platform** to Railway so a
+Lovable.dev app can call one public HTTPS domain. The repository's
+`railway.json` selects the all-in-one image automatically.
 
 | Service  | Port (local default) | Covers |
 |----------|-----------------------|--------|
@@ -11,16 +12,18 @@ This guide deploys a **core subset** of the platform to Railway so a frontend
 | `geo`      | 8083 | Driver location tracking / geospatial queries |
 | `payments` | 8084 | Stripe charges, wallets, payouts |
 
-Deliberately **not** deployed yet (add later the same way if you need them):
+The `mobile` process already contains most extended product modules, including
+ratings, scheduling, safety, documents, support, chat, loyalty, pooling,
+delivery, corporate rides, fraud and pricing. Deliberately **not** started as
+separate processes in the one-service deployment:
 Kong, Istio, NATS, Prometheus/Grafana, self-hosted Sentry, MinIO, and the
 remaining 9 microservices (`notifications`, `realtime`, `admin`, `promos`,
 `scheduler`, `analytics`, `fraud`, `ml-eta`, `negotiation`). None of the core
 5 services require any of them to start — `NATS_ENABLED` defaults to `false`
 and the code just logs a warning and disables async events when it's off.
 
-Two things were fixed in this repo to make this deployment topology work
-(each service runs as its own independent container, unlike a single-box
-docker-compose setup):
+Two existing application-level fixes make both the single-container and
+separate-service deployment topologies work:
 
 1. **`mobile` had no CORS middleware.** A browser-based frontend calling it
    directly would have been blocked. Added `middleware.CORS()`.
@@ -35,12 +38,33 @@ docker-compose setup):
    **This means `JWT_SECRET` must be set to the same non-empty value on
    every service**, or auth will silently fail across services.
 
+## Recommended: one Railway application service
+
+You do **not** have to create five Railway application services for an MVP.
+`deploy/railway/all-in-one/Dockerfile` builds the five core binaries and a small
+gateway. They run in one container on private loopback ports, while the gateway
+listens on Railway's public `PORT` and exposes these stable prefixes:
+
+| Public prefix | Upstream service | Example |
+|---------------|------------------|---------|
+| `/auth` | Auth | `POST /auth/api/v1/auth/login` |
+| `/mobile` | Mobile feature API | `GET /mobile/api/v1/ride-types/available` |
+| `/rides` | Ride lifecycle | `POST /rides/api/v1/rides` |
+| `/geo` | Driver location | `POST /geo/api/v1/geo/location` |
+| `/payments` | Payments | `GET /payments/api/v1/wallet` |
+
+The prefix is removed before the request reaches its service. This gives the
+frontend one base URL without changing the existing APIs.
+
 ## 1. Create the Railway project
 
 1. In Railway, **New Project → Deploy from GitHub repo** → select this repo.
-   Railway will ask about a service — cancel/skip the auto-detected one, you
-   will add the 5 services manually below (or delete it after).
-2. **Add a Postgres plugin** (`+ New → Database → PostgreSQL`).
+   Railway reads `railway.json` and builds
+   `deploy/railway/all-in-one/Dockerfile`. Do not set a Dockerfile path or a
+   `SERVICE_NAME` build argument for this deployment.
+2. **Add a PostgreSQL service** (`+ New → Database → PostgreSQL`). The schema is
+   compatible with Railway's standard managed PostgreSQL image; no PostGIS
+   template is required.
 3. **Add a Redis plugin** (`+ New → Database → Redis`).
 
 Note Postgres's plugin variables (Settings → Variables on the Postgres
@@ -48,18 +72,102 @@ service): `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE` (default
 database name is `railway`). Note Redis's `REDISHOST`, `REDISPORT`,
 `REDISPASSWORD`.
 
-## 2. Run migrations once
+## 2. Configure variables
 
-1. `+ New → Empty Service` (or GitHub repo again) named `migrate`.
-2. Settings → Build → **Dockerfile Path**: `deploy/railway/migrate/Dockerfile`.
-3. Variables → add `DATABASE_URL` = `${{Postgres.DATABASE_URL}}` (reference
-   the Postgres plugin's own connection string variable).
-4. Deploy. Check the logs for `Migrations complete` (48 migrations run).
-5. Once confirmed, pause or delete this service — it's a one-off job, not a
-   long-running service. Re-run it (redeploy) any time you need to apply new
-   migrations later.
+Railway does not automatically expose one service's variables to another.
+Open the **application service → Variables → Add Reference**, select the
+Postgres service, and add its `DATABASE_URL`. Do not type the literal example
+value as plain text: it must be a Railway variable reference. Migrations run
+automatically at startup, before any API process is launched.
 
-## 3. Create the 5 app services
+```dotenv
+DATABASE_URL=${{Postgres.DATABASE_URL}}
+
+REDIS_HOST=${{Redis.REDISHOST}}
+REDIS_PORT=${{Redis.REDISPORT}}
+REDIS_PASSWORD=${{Redis.REDISPASSWORD}}
+
+ENVIRONMENT=production
+JWT_SECRET=<one-long-random-secret>
+CORS_ORIGINS=https://your-app.lovable.app,https://your-preview-domain
+STRIPE_API_KEY=sk_test_...
+STRIPE_WEBHOOK_SECRET=whsec_...
+```
+
+Only the Postgres `DATABASE_URL` reference is required for database setup; the
+container derives `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, and `DB_NAME`
+for the five Go processes. As an alternative, the startup script also accepts
+individual `PG*` or `DB_*` variables and constructs the migration URL.
+
+If the logs say `PostgreSQL is not linked to this application`, the reference
+is missing from the **application service**, even if the Postgres service itself
+shows a `DATABASE_URL` variable.
+
+Older deployments may report `Dirty database version 5`. Earlier migrations
+tried to install PostGIS, `postgis_topology`, and `pg_stat_statements`, which are
+not available in Railway's standard PostgreSQL image. Core migrations now use
+portable PostgreSQL: geographic boundaries are stored as WKT text, analytical
+zones use rounded coordinates, and live nearby-driver matching remains in
+Redis. Startup automatically repairs **only** the known dirty version 5 by
+resetting its migration marker to version 4 and rerunning the corrected
+migration. Unknown dirty versions are never forced automatically because doing
+so could hide a partially applied schema change.
+
+Do not set `PORT`; Railway supplies it. Generate a public domain under
+**Settings → Networking**, then deploy.
+
+If an older deployment reports `./bin/mobile: not found`, redeploy the latest
+commit with Railway's build cache cleared. The all-in-one Docker build now fails
+immediately if any individual Go binary fails to compile and verifies every
+expected executable before publishing the image. Startup performs the same
+preflight before running migrations. Both `mobile` and `geo` are compiled with
+CGO enabled because the mobile feature API transitively includes the H3 spatial
+library; compiling mobile with `CGO_ENABLED=0` was the reason the old build loop
+silently omitted that binary.
+
+## 3. Call it from Lovable
+
+Set one frontend variable:
+
+```dotenv
+VITE_API_URL=https://your-backend.up.railway.app
+```
+
+Examples:
+
+```javascript
+const API = import.meta.env.VITE_API_URL;
+
+await fetch(`${API}/auth/api/v1/auth/login`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ email, password }),
+});
+
+await fetch(`${API}/rides/api/v1/rides`, {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${token}`,
+  },
+  body: JSON.stringify(rideRequest),
+});
+```
+
+Check the deployment with `curl https://your-backend.up.railway.app/healthz`.
+It returns HTTP 200 only when all five processes are healthy.
+
+## Why separate services may still be better later
+
+One service is cheaper and simpler, and is now the recommended MVP setup.
+Separate Railway services provide independent scaling, deploys, logs, crash
+isolation and resource limits. In the all-in-one container, one deployment
+contains five database pools and a restart affects every API. Move to the
+separate layout when traffic or team size makes those trade-offs worthwhile.
+
+## Alternative: five independently scalable Railway services
+
+### Create the 5 app services
 
 For each of `auth`, `mobile`, `rides`, `geo`, `payments`:
 
@@ -69,6 +177,11 @@ For each of `auth`, `mobile`, `rides`, `geo`, `payments`:
 3. Settings → Build → **Dockerfile Path**: `deploy/railway/<name>/Dockerfile`
    (e.g. `deploy/railway/auth/Dockerfile`). Root/build context stays the
    repo root — don't change it.
+   This explicit Dockerfile path is the recommended approach. If you instead
+   use the root `Dockerfile`, configure the Docker build argument
+   `SERVICE_NAME=<name>` in Railway's build settings; setting it only in the
+   Variables tab is not sufficient. With no build argument, the root
+   `Dockerfile` intentionally defaults to `auth`.
 4. Settings → Networking → **Generate Domain** to get a public HTTPS URL.
 5. Variables (add these on **every one of the 5 services**, identical
    values, unless noted otherwise):
@@ -106,7 +219,7 @@ For each of `auth`, `mobile`, `rides`, `geo`, `payments`:
 6. Deploy. Check each service's logs for `Server starting` (or equivalent)
    with no fatal DB/Redis connection errors.
 
-## 4. Verify
+### Verify the separate deployment
 
 ```bash
 curl https://auth-production-XXXX.up.railway.app/healthz
@@ -119,7 +232,7 @@ Use the JWT from the login/register response as `Authorization: Bearer <token>`
 against `mobile`/`rides`/`geo`/`payments` endpoints (exact routes are in
 `docs/API.md`).
 
-## 5. Point the Lovable.dev frontend at it
+### Point Lovable.dev at the separate deployment
 
 In Lovable, set environment/config values (or hardcode in your API client)
 to the Railway-issued URLs, one per service, e.g.:
@@ -136,7 +249,7 @@ serves your app from (including the preview-domain origin, if different from
 the published one) — the middleware does an exact string match, not a
 wildcard subdomain match.
 
-## Known gaps in this minimal deploy
+## Known gaps in these MVP deployments
 
 - `mobile` calls out to `NOTIFICATIONS_SERVICE_URL` and
   `PROMOS_SERVICE_URL` for a few specific features (scheduled-ride
@@ -149,6 +262,7 @@ wildcard subdomain match.
   shared store (Vault, via `JWT_KEYS_VAULT_*`) — the fallback fix above
   covers normal signing/verification correctly as long as `JWT_SECRET` is
   set and identical everywhere, which is sufficient for an MVP.
-- No API gateway (Kong) in front of these yet, so the frontend talks to
-  each service's own Railway domain directly. Fine for an MVP; add Kong
-  later if you want a single entrypoint/rate limiting/auth-at-the-edge.
+- The all-in-one option uses the included lightweight prefix gateway, not Kong.
+  The separate option exposes one Railway domain per service. Add Kong later if
+  you need centralized edge authentication, advanced routing or gateway-level
+  rate limiting.

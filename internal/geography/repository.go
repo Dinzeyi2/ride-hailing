@@ -169,7 +169,7 @@ func (r *Repository) GetRegionByID(ctx context.Context, id uuid.UUID) (*Region, 
 func (r *Repository) GetCitiesByRegion(ctx context.Context, regionID uuid.UUID) ([]*City, error) {
 	query := `
 		SELECT id, region_id, name, native_name, timezone, center_latitude,
-		       center_longitude, ST_AsText(boundary), population, is_active,
+		       center_longitude, boundary, population, is_active,
 		       launched_at, created_at, updated_at
 		FROM cities
 		WHERE region_id = $1 AND is_active = true
@@ -204,7 +204,7 @@ func (r *Repository) GetCitiesByRegion(ctx context.Context, regionID uuid.UUID) 
 func (r *Repository) GetCityByID(ctx context.Context, id uuid.UUID) (*City, error) {
 	query := `
 		SELECT city.id, city.region_id, city.name, city.native_name, city.timezone,
-		       city.center_latitude, city.center_longitude, ST_AsText(city.boundary),
+		       city.center_latitude, city.center_longitude, city.boundary,
 		       city.population, city.is_active, city.launched_at, city.created_at, city.updated_at,
 		       reg.id, reg.country_id, reg.code, reg.name, reg.native_name, reg.timezone,
 		       reg.is_active, reg.launched_at, reg.created_at, reg.updated_at,
@@ -248,10 +248,11 @@ func (r *Repository) ResolveLocation(ctx context.Context, latitude, longitude fl
 		Location: Location{Latitude: latitude, Longitude: longitude},
 	}
 
-	// Find city containing the point (uses PostGIS ST_Contains)
+	// Find the closest active city center. Boundaries are stored as portable WKT
+	// text on managed PostgreSQL, while precise live-driver matching uses Redis.
 	cityQuery := `
 		SELECT city.id, city.region_id, city.name, city.native_name, city.timezone,
-		       city.center_latitude, city.center_longitude, ST_AsText(city.boundary),
+		       city.center_latitude, city.center_longitude, city.boundary,
 		       city.population, city.is_active, city.launched_at, city.created_at, city.updated_at,
 		       reg.id, reg.country_id, reg.code, reg.name, reg.native_name, reg.timezone,
 		       reg.is_active, reg.launched_at, reg.created_at, reg.updated_at,
@@ -265,8 +266,8 @@ func (r *Repository) ResolveLocation(ctx context.Context, latitude, longitude fl
 		WHERE city.is_active = true
 		  AND reg.is_active = true
 		  AND c.is_active = true
-		  AND ST_Contains(city.boundary, ST_SetSRID(ST_MakePoint($1, $2), 4326))
-		ORDER BY city.population DESC NULLS LAST
+			ORDER BY POWER(city.center_longitude - $1, 2) + POWER(city.center_latitude - $2, 2),
+			         city.population DESC NULLS LAST
 		LIMIT 1
 	`
 
@@ -305,14 +306,14 @@ func (r *Repository) ResolveLocation(ctx context.Context, latitude, longitude fl
 	// Find pricing zone containing the point (highest priority)
 	if result.City != nil {
 		zoneQuery := `
-			SELECT id, city_id, name, zone_type, ST_AsText(boundary),
+				SELECT id, city_id, name, zone_type, boundary,
 			       center_latitude, center_longitude, priority, is_active,
 			       metadata, created_at, updated_at
 			FROM pricing_zones
 			WHERE city_id = $1
 			  AND is_active = true
-			  AND ST_Contains(boundary, ST_SetSRID(ST_MakePoint($2, $3), 4326))
-			ORDER BY priority DESC
+				ORDER BY priority DESC,
+				         POWER(center_longitude - $2, 2) + POWER(center_latitude - $3, 2)
 			LIMIT 1
 		`
 
@@ -334,12 +335,13 @@ func (r *Repository) ResolveLocation(ctx context.Context, latitude, longitude fl
 func (r *Repository) FindNearestCity(ctx context.Context, latitude, longitude float64, maxDistanceKm float64) (*City, error) {
 	query := `
 		SELECT city.id, city.region_id, city.name, city.native_name, city.timezone,
-		       city.center_latitude, city.center_longitude, ST_AsText(city.boundary),
+		       city.center_latitude, city.center_longitude, city.boundary,
 		       city.population, city.is_active, city.launched_at, city.created_at, city.updated_at,
-		       ST_Distance(
-		           ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
-		           ST_SetSRID(ST_MakePoint(city.center_longitude, city.center_latitude), 4326)::geography
-		       ) / 1000 AS distance_km
+		       6371 * ACOS(LEAST(1, GREATEST(-1,
+		           COS(RADIANS($2)) * COS(RADIANS(city.center_latitude)) *
+		           COS(RADIANS(city.center_longitude) - RADIANS($1)) +
+		           SIN(RADIANS($2)) * SIN(RADIANS(city.center_latitude))
+		       ))) AS distance_km
 		FROM cities city
 		JOIN regions reg ON city.region_id = reg.id
 		JOIN countries c ON reg.country_id = c.id
@@ -372,7 +374,7 @@ func (r *Repository) FindNearestCity(ctx context.Context, latitude, longitude fl
 // GetPricingZonesByCity retrieves all active pricing zones for a city
 func (r *Repository) GetPricingZonesByCity(ctx context.Context, cityID uuid.UUID) ([]*PricingZone, error) {
 	query := `
-		SELECT id, city_id, name, zone_type, ST_AsText(boundary),
+			SELECT id, city_id, name, zone_type, boundary,
 		       center_latitude, center_longitude, priority, is_active,
 		       metadata, created_at, updated_at
 		FROM pricing_zones
@@ -536,7 +538,7 @@ func (r *Repository) CreateCity(ctx context.Context, city *City) error {
 		INSERT INTO cities (id, region_id, name, native_name, timezone,
 		                    center_latitude, center_longitude, boundary, population, is_active)
 		VALUES ($1, $2, $3, $4, $5, $6, $7,
-		        CASE WHEN $8::text IS NOT NULL THEN ST_GeomFromText($8, 4326) ELSE NULL END,
+			        $8,
 		        $9, $10)
 		RETURNING created_at, updated_at
 	`
@@ -686,7 +688,7 @@ func (r *Repository) GetAllCities(ctx context.Context, regionID *uuid.UUID, limi
 
 	query := fmt.Sprintf(`
 		SELECT id, region_id, name, native_name, timezone, center_latitude,
-		       center_longitude, ST_AsText(boundary), population, is_active,
+		       center_longitude, boundary, population, is_active,
 		       launched_at, created_at, updated_at
 		FROM cities %s
 		ORDER BY name
@@ -742,7 +744,7 @@ func (r *Repository) GetAllPricingZones(ctx context.Context, cityID *uuid.UUID, 
 	}
 
 	query := fmt.Sprintf(`
-		SELECT id, city_id, name, zone_type, ST_AsText(boundary),
+			SELECT id, city_id, name, zone_type, boundary,
 		       center_latitude, center_longitude, priority, is_active,
 		       metadata, created_at, updated_at
 		FROM pricing_zones %s
@@ -848,7 +850,7 @@ func (r *Repository) UpdateCity(ctx context.Context, city *City) error {
 		UPDATE cities SET
 			region_id = $2, name = $3, native_name = $4, timezone = $5,
 			center_latitude = $6, center_longitude = $7,
-			boundary = CASE WHEN $8::text IS NOT NULL THEN ST_GeomFromText($8, 4326) ELSE boundary END,
+				boundary = COALESCE($8, boundary),
 			population = $9, is_active = $10, updated_at = NOW()
 		WHERE id = $1
 		RETURNING updated_at
@@ -882,7 +884,7 @@ func (r *Repository) UpdatePricingZone(ctx context.Context, zone *PricingZone) e
 	query := `
 		UPDATE pricing_zones SET
 			city_id = $2, name = $3, zone_type = $4,
-			boundary = ST_GeomFromText($5, 4326),
+				boundary = $5,
 			center_latitude = $6, center_longitude = $7,
 			priority = $8, is_active = $9, metadata = $10,
 			updated_at = NOW()
@@ -914,7 +916,7 @@ func (r *Repository) DeletePricingZone(ctx context.Context, id uuid.UUID) error 
 // GetPricingZoneByID retrieves a pricing zone by its ID
 func (r *Repository) GetPricingZoneByID(ctx context.Context, id uuid.UUID) (*PricingZone, error) {
 	query := `
-		SELECT id, city_id, name, zone_type, ST_AsText(boundary),
+			SELECT id, city_id, name, zone_type, boundary,
 		       center_latitude, center_longitude, priority, is_active,
 		       metadata, created_at, updated_at
 		FROM pricing_zones
@@ -970,7 +972,7 @@ func (r *Repository) CreatePricingZone(ctx context.Context, zone *PricingZone) e
 		INSERT INTO pricing_zones (id, city_id, name, zone_type, boundary,
 		                           center_latitude, center_longitude, priority,
 		                           is_active, metadata)
-		VALUES ($1, $2, $3, $4, ST_GeomFromText($5, 4326), $6, $7, $8, $9, $10)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		RETURNING created_at, updated_at
 	`
 

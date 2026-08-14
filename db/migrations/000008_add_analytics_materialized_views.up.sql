@@ -4,7 +4,7 @@
 -- 1. Demand Zones - High-demand geographical areas
 CREATE MATERIALIZED VIEW IF NOT EXISTS mv_demand_zones AS
 SELECT
-    ST_SnapToGrid(ST_MakePoint(pickup_longitude, pickup_latitude), 0.01) AS zone_point,
+    CONCAT(ROUND(pickup_latitude::numeric, 2), ',', ROUND(pickup_longitude::numeric, 2)) AS zone_point,
     COUNT(*) AS ride_count,
     AVG(estimated_fare) AS avg_fare,
     COUNT(CASE WHEN status = 'completed' THEN 1 END) AS completed_count,
@@ -18,7 +18,7 @@ HAVING COUNT(*) >= 5;
 
 -- Create index on demand zones
 CREATE INDEX IF NOT EXISTS idx_mv_demand_zones_zone 
-ON mv_demand_zones USING GIST(zone_point);
+ON mv_demand_zones(zone_point);
 
 CREATE INDEX IF NOT EXISTS idx_mv_demand_zones_time 
 ON mv_demand_zones(hour_of_day, day_of_week);
