@@ -53,7 +53,7 @@ if ! ./bin/migrate -path ./db/migrations -database "$DATABASE_URL" up; then
       echo "Repairing the known legacy dirty migration at version 5..." >&2
       ./bin/migrate -path ./db/migrations -database "$DATABASE_URL" force 4
       if ! ./bin/migrate -path ./db/migrations -database "$DATABASE_URL" up; then
-        echo "Migration 5 still failed after repair. This backend requires a PostGIS-enabled PostgreSQL service; Railway's plain PostgreSQL image may not provide the postgis extension." >&2
+        echo "Migration 5 still failed after repair; inspect the SQL error above before changing the migration marker again." >&2
         exit 1
       fi
       ;;
