@@ -94,6 +94,16 @@ STRIPE_API_KEY=sk_test_...
 STRIPE_WEBHOOK_SECRET=whsec_...
 ```
 
+`STRIPE_API_KEY` is optional for initial health checks and non-Stripe wallet
+routes. Without it, the Payments API remains online but Stripe charge, refund,
+and payout operations are disabled until a real key is added.
+
+The launcher accepts Railway's native `REDISHOST`/`REDISPORT` references and
+normalizes them to the application's `REDIS_HOST`/`REDIS_PORT` names. The
+all-in-one image also disables a stale localhost OpenTelemetry endpoint because
+it does not contain an OTel collector; configure a remote HTTP(S) endpoint if
+tracing is required.
+
 Only the Postgres `DATABASE_URL` reference is required for database setup; the
 container derives `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, and `DB_NAME`
 for the five Go processes. As an alternative, the startup script also accepts

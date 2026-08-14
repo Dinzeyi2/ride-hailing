@@ -54,6 +54,29 @@ else
 fi
 export DATABASE_URL DB_SSLMODE
 
+# Normalize Railway Redis plugin names to the names consumed by pkg/config.
+# Railway currently exposes REDISHOST/REDISPORT, while the application expects
+# REDIS_HOST/REDIS_PORT.
+export REDIS_HOST="${REDIS_HOST:-${REDISHOST:-localhost}}"
+export REDIS_PORT="${REDIS_PORT:-${REDISPORT:-6379}}"
+export REDIS_PASSWORD="${REDIS_PASSWORD:-${REDISPASSWORD:-}}"
+export REDIS_DB="${REDIS_DB:-0}"
+
+# The all-in-one image does not run an OpenTelemetry collector. A stale local
+# endpoint only creates noisy exporter errors, so disable it. Remote collectors
+# remain supported and schemeless endpoints are normalized for the OTLP client.
+export GIN_MODE="${GIN_MODE:-release}"
+if [ "${OTEL_ENABLED:-false}" = "true" ]; then
+  case "${OTEL_EXPORTER_OTLP_ENDPOINT:-}" in
+    ""|localhost:*|127.0.0.1:*|http://localhost:*|http://127.0.0.1:*)
+      echo "Disabling OpenTelemetry: no collector runs in the all-in-one container"
+      export OTEL_ENABLED=false
+      ;;
+    http://*|https://*) ;;
+    *) export OTEL_EXPORTER_OTLP_ENDPOINT="http://${OTEL_EXPORTER_OTLP_ENDPOINT}" ;;
+  esac
+fi
+
 echo "Applying database migrations..."
 if ! ./bin/migrate -path ./db/migrations -database "$DATABASE_URL" up; then
   migration_version=$(./bin/migrate -path ./db/migrations -database "$DATABASE_URL" version 2>&1 || true)
