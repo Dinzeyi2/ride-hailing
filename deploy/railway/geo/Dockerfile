@@ -3,7 +3,7 @@
 # deploy/railway/geo/Dockerfile and leave the build context at the repo root.
 FROM golang:1.24-alpine AS builder
 
-RUN apk add --no-cache git make
+RUN apk add --no-cache git make build-base
 
 WORKDIR /app
 
@@ -13,7 +13,8 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o /app/service ./cmd/geo
+# H3's Go bindings contain C sources and require CGO.
+RUN CGO_ENABLED=1 GOOS=linux go build -trimpath -o /app/service ./cmd/geo
 
 FROM alpine:latest
 
