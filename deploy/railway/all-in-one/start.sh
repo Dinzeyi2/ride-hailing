@@ -47,8 +47,21 @@ export DATABASE_URL DB_SSLMODE
 
 echo "Applying database migrations..."
 if ! ./bin/migrate -path ./db/migrations -database "$DATABASE_URL" up; then
-  echo "Database migration failed" >&2
-  exit 1
+  migration_version=$(./bin/migrate -path ./db/migrations -database "$DATABASE_URL" version 2>&1 || true)
+  case "$migration_version" in
+    "5 (dirty)"*)
+      echo "Repairing the known legacy dirty migration at version 5..." >&2
+      ./bin/migrate -path ./db/migrations -database "$DATABASE_URL" force 4
+      if ! ./bin/migrate -path ./db/migrations -database "$DATABASE_URL" up; then
+        echo "Migration 5 still failed after repair. This backend requires a PostGIS-enabled PostgreSQL service; Railway's plain PostgreSQL image may not provide the postgis extension." >&2
+        exit 1
+      fi
+      ;;
+    *)
+      echo "Database migration failed (state: $migration_version). Refusing to force an unknown dirty version." >&2
+      exit 1
+      ;;
+  esac
 fi
 
 # Internal calls bypass the public gateway and stay inside this container.

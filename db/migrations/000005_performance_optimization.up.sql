@@ -3,7 +3,6 @@
 
 -- 1. Enable PostGIS extension for geospatial queries
 CREATE EXTENSION IF NOT EXISTS postgis;
-CREATE EXTENSION IF NOT EXISTS postgis_topology;
 
 -- 2. Fix payments table schema to match repository/model
 -- Add missing Stripe-related columns
@@ -123,26 +122,11 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- 8. Add pg_stat_statements extension for query performance monitoring
-CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
-
--- 9. Create view for slow query monitoring
-CREATE OR REPLACE VIEW slow_queries AS
-SELECT
-    query,
-    calls,
-    total_exec_time,
-    mean_exec_time,
-    max_exec_time,
-    stddev_exec_time,
-    rows
-FROM pg_stat_statements
-WHERE mean_exec_time > 100 -- queries taking more than 100ms on average
-ORDER BY mean_exec_time DESC;
+-- Optional query-monitoring extensions are infrastructure concerns and are not
+-- installed by application migrations on managed PostgreSQL.
 
 -- 10. Add comment documentation
 COMMENT ON EXTENSION postgis IS 'PostGIS geometry and geography spatial types and functions';
-COMMENT ON EXTENSION pg_stat_statements IS 'Track planning and execution statistics of all SQL statements';
 COMMENT ON MATERIALIZED VIEW driver_statistics IS 'Cached driver performance statistics - refresh periodically';
 COMMENT ON FUNCTION refresh_driver_statistics() IS 'Refresh the driver_statistics materialized view concurrently';
 COMMENT ON FUNCTION get_nearby_drivers_postgis(DOUBLE PRECISION, DOUBLE PRECISION, DOUBLE PRECISION) IS 'Find nearby available drivers using PostGIS within radius (latitude, longitude, radius_meters)';

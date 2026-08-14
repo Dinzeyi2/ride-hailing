@@ -62,7 +62,9 @@ frontend one base URL without changing the existing APIs.
    Railway reads `railway.json` and builds
    `deploy/railway/all-in-one/Dockerfile`. Do not set a Dockerfile path or a
    `SERVICE_NAME` build argument for this deployment.
-2. **Add a Postgres plugin** (`+ New → Database → PostgreSQL`).
+2. **Add a PostGIS-enabled PostgreSQL service** from Railway's template
+   marketplace. Do not use a plain PostgreSQL image: later geography migrations
+   create `GEOMETRY` columns and spatial indexes.
 3. **Add a Redis plugin** (`+ New → Database → Redis`).
 
 Note Postgres's plugin variables (Settings → Variables on the Postgres
@@ -100,6 +102,17 @@ individual `PG*` or `DB_*` variables and constructs the migration URL.
 If the logs say `PostgreSQL is not linked to this application`, the reference
 is missing from the **application service**, even if the Postgres service itself
 shows a `DATABASE_URL` variable.
+
+Older deployments may report `Dirty database version 5`. The previous version
+of migration 5 also tried to install optional `postgis_topology` and
+`pg_stat_statements` components. Those optional components have been removed;
+core PostGIS remains required by the geography schema. Startup automatically
+repairs **only** that known dirty version by resetting its migration marker to
+version 4 and rerunning the corrected migration. Unknown dirty versions are
+never forced automatically because doing so could hide a partially applied
+schema change. If the retry says the `postgis` extension is unavailable, replace
+the plain database with a PostGIS-enabled Railway template and update the
+`DATABASE_URL` reference.
 
 Do not set `PORT`; Railway supplies it. Generate a public domain under
 **Settings → Networking**, then deploy.
