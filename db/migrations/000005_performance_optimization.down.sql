@@ -1,7 +1,6 @@
 -- Rollback Performance Optimization Migration
 
 -- Drop views and functions
-DROP VIEW IF EXISTS slow_queries;
 DROP FUNCTION IF EXISTS get_nearby_drivers_postgis(DOUBLE PRECISION, DOUBLE PRECISION, DOUBLE PRECISION);
 DROP FUNCTION IF EXISTS refresh_driver_statistics();
 DROP MATERIALIZED VIEW IF EXISTS driver_statistics;
@@ -38,6 +37,4 @@ ALTER TABLE payments ALTER COLUMN commission SET NOT NULL;
 ALTER TABLE payments ALTER COLUMN driver_earnings SET NOT NULL;
 
 -- Drop extensions (only if no other objects depend on them)
-DROP EXTENSION IF EXISTS pg_stat_statements;
-DROP EXTENSION IF EXISTS postgis_topology CASCADE;
 DROP EXTENSION IF EXISTS postgis CASCADE;
