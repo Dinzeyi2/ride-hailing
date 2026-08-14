@@ -23,10 +23,13 @@ func NewRepository(db *pgxpool.Pool) *Repository {
 // CreatePayment creates a new payment record
 func (r *Repository) CreatePayment(ctx context.Context, payment *models.Payment) error {
 	query := `
-		INSERT INTO payments (id, ride_id, rider_id, driver_id, amount, currency,
-			payment_method, status, stripe_payment_id, stripe_charge_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-		RETURNING created_at, updated_at`
+			INSERT INTO payments (id, ride_id, rider_id, driver_id, amount, currency,
+				payment_method, status, stripe_payment_id, stripe_charge_id,
+				trip_value, service_fee, government_fees, commission,
+				commission_rate, driver_earnings, driver_keep_rate)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+				$11, $12, $13, $14, $15, $16, $17)
+			RETURNING created_at, updated_at`
 
 	err := r.db.QueryRow(ctx, query,
 		payment.ID,
@@ -39,6 +42,13 @@ func (r *Repository) CreatePayment(ctx context.Context, payment *models.Payment)
 		payment.Status,
 		payment.StripePaymentID,
 		payment.StripeChargeID,
+		payment.TripValue,
+		payment.ServiceFee,
+		payment.GovernmentFees,
+		payment.Commission,
+		payment.CommissionRate,
+		payment.DriverEarnings,
+		payment.DriverKeepRate,
 	).Scan(&payment.CreatedAt, &payment.UpdatedAt)
 
 	if err != nil {
@@ -52,9 +62,11 @@ func (r *Repository) CreatePayment(ctx context.Context, payment *models.Payment)
 func (r *Repository) GetPaymentByID(ctx context.Context, id uuid.UUID) (*models.Payment, error) {
 	payment := &models.Payment{}
 	query := `
-		SELECT id, ride_id, rider_id, driver_id, amount, currency, payment_method,
-			status, stripe_payment_id, stripe_charge_id, metadata,
-			created_at, updated_at
+			SELECT id, ride_id, rider_id, driver_id, amount, trip_value, service_fee,
+				government_fees, currency, payment_method, status, stripe_payment_id,
+				stripe_charge_id, metadata, commission, commission_rate,
+				driver_earnings, driver_keep_rate,
+				created_at, updated_at
 		FROM payments
 		WHERE id = $1`
 
@@ -64,12 +76,19 @@ func (r *Repository) GetPaymentByID(ctx context.Context, id uuid.UUID) (*models.
 		&payment.RiderID,
 		&payment.DriverID,
 		&payment.Amount,
+		&payment.TripValue,
+		&payment.ServiceFee,
+		&payment.GovernmentFees,
 		&payment.Currency,
 		&payment.PaymentMethod,
 		&payment.Status,
 		&payment.StripePaymentID,
 		&payment.StripeChargeID,
 		&payment.Metadata,
+		&payment.Commission,
+		&payment.CommissionRate,
+		&payment.DriverEarnings,
+		&payment.DriverKeepRate,
 		&payment.CreatedAt,
 		&payment.UpdatedAt,
 	)
@@ -109,8 +128,10 @@ func (r *Repository) GetRideDriverID(ctx context.Context, rideID uuid.UUID) (*uu
 // GetPaymentsByRideID retrieves payments for a specific ride
 func (r *Repository) GetPaymentsByRideID(ctx context.Context, rideID uuid.UUID) ([]*models.Payment, error) {
 	query := `
-		SELECT id, ride_id, rider_id, driver_id, amount, currency, payment_method,
-			status, stripe_payment_id, stripe_charge_id, metadata,
+			SELECT id, ride_id, rider_id, driver_id, amount, trip_value, service_fee,
+				government_fees, currency, payment_method, status, stripe_payment_id,
+				stripe_charge_id, metadata, commission, commission_rate,
+				driver_earnings, driver_keep_rate,
 			created_at, updated_at
 		FROM payments
 		WHERE ride_id = $1
@@ -131,12 +152,19 @@ func (r *Repository) GetPaymentsByRideID(ctx context.Context, rideID uuid.UUID) 
 			&payment.RiderID,
 			&payment.DriverID,
 			&payment.Amount,
+			&payment.TripValue,
+			&payment.ServiceFee,
+			&payment.GovernmentFees,
 			&payment.Currency,
 			&payment.PaymentMethod,
 			&payment.Status,
 			&payment.StripePaymentID,
 			&payment.StripeChargeID,
 			&payment.Metadata,
+			&payment.Commission,
+			&payment.CommissionRate,
+			&payment.DriverEarnings,
+			&payment.DriverKeepRate,
 			&payment.CreatedAt,
 			&payment.UpdatedAt,
 		)
@@ -505,11 +533,17 @@ func (r *Repository) ProcessPaymentWithWallet(ctx context.Context, payment *mode
 
 	// Create payment record
 	_, err = tx.Exec(ctx, `
-		INSERT INTO payments (id, ride_id, rider_id, driver_id, amount, currency,
-			payment_method, status, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())`,
+			INSERT INTO payments (id, ride_id, rider_id, driver_id, amount, currency,
+				payment_method, status, trip_value, service_fee, government_fees,
+				commission, commission_rate, driver_earnings, driver_keep_rate,
+				created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+				$12, $13, $14, $15, NOW(), NOW())`,
 		payment.ID, payment.RideID, payment.RiderID, payment.DriverID,
-		payment.Amount, payment.Currency, payment.PaymentMethod, "completed")
+		payment.Amount, payment.Currency, payment.PaymentMethod, "completed",
+		payment.TripValue, payment.ServiceFee, payment.GovernmentFees,
+		payment.Commission, payment.CommissionRate, payment.DriverEarnings,
+		payment.DriverKeepRate)
 	if err != nil {
 		return common.NewInternalError("failed to create payment", err)
 	}
@@ -568,4 +602,103 @@ func (r *Repository) GetDriverEarningsSummary(ctx context.Context, driverID uuid
 		WHERE driver_id = $1
 	`, driverID).Scan(&daily, &weekly, &pending)
 	return
+}
+
+// GetRidePricingSnapshot returns the immutable price split created at ride completion.
+// When riderID is uuid.Nil it is an internal lookup and ownership is not applied.
+func (r *Repository) GetRidePricingSnapshot(ctx context.Context, rideID, riderID uuid.UUID) (*RidePricingSnapshot, error) {
+	snapshot := &RidePricingSnapshot{}
+	query := `
+		SELECT s.trip_value, s.service_fee, s.government_fees, s.rider_total,
+		       s.commission_rate, s.commission_amount, s.driver_keep_rate,
+		       s.driver_payout, s.weekly_ride_number
+		FROM ride_commission_snapshots s
+		JOIN rides r ON r.id = s.ride_id
+		WHERE s.ride_id = $1 AND ($2::uuid = '00000000-0000-0000-0000-000000000000' OR r.rider_id = $2)`
+	err := r.db.QueryRow(ctx, query, rideID, riderID).Scan(
+		&snapshot.TripValue, &snapshot.ServiceFee, &snapshot.GovernmentFees,
+		&snapshot.RiderTotal, &snapshot.CommissionRate, &snapshot.CommissionAmount,
+		&snapshot.DriverKeepRate, &snapshot.DriverPayout, &snapshot.WeeklyRideNumber,
+	)
+	if err != nil {
+		return nil, common.NewNotFoundError("finalized ride price not found", err)
+	}
+	return snapshot, nil
+}
+
+// GetDriverRewardProgress returns the current UTC week's prospective keep rate.
+func (r *Repository) GetDriverRewardProgress(ctx context.Context, driverID uuid.UUID) (*DriverRewardProgress, error) {
+	progress := &DriverRewardProgress{}
+	var nextMin *int
+	err := r.db.QueryRow(ctx, `
+		WITH current_progress AS (
+			SELECT date_trunc('week', NOW() AT TIME ZONE 'UTC')::date AS week_start,
+			       COALESCE(w.completed_rides, 0) AS completed_rides,
+			       COALESCE(w.current_commission_rate, 0.20) AS commission_rate,
+			       COALESCE(w.current_keep_rate, 0.80) AS keep_rate
+			FROM (SELECT 1) seed
+			LEFT JOIN driver_weekly_rewards w
+			  ON w.driver_id = $1
+			 AND w.week_start = date_trunc('week', NOW() AT TIME ZONE 'UTC')::date
+		)
+		SELECT p.week_start::text, p.completed_rides, p.commission_rate, p.keep_rate,
+		       (SELECT MIN(t.min_ride) FROM commission_tiers t WHERE t.min_ride > p.completed_rides + 1)
+		FROM current_progress p`, driverID).Scan(
+		&progress.WeekStart, &progress.CompletedRides, &progress.CurrentCommissionRate,
+		&progress.CurrentKeepRate, &nextMin,
+	)
+	if err != nil {
+		return nil, common.NewInternalError("failed to get driver reward progress", err)
+	}
+	if nextMin == nil {
+		progress.Message = fmt.Sprintf("Top tier unlocked — you keep %.0f%% this week", progress.CurrentKeepRate*100)
+		return progress, nil
+	}
+	unlockAt := *nextMin - 1
+	progress.RidesUntilNextTier = unlockAt - progress.CompletedRides
+	if progress.RidesUntilNextTier < 0 {
+		progress.RidesUntilNextTier = 0
+	}
+	if err := r.db.QueryRow(ctx, `SELECT driver_keep_rate FROM commission_tiers WHERE min_ride = $1`, *nextMin).Scan(&progress.NextKeepRate); err != nil {
+		return nil, common.NewInternalError("failed to get next reward tier", err)
+	}
+	progress.Message = fmt.Sprintf("%d more rides until you keep %.0f%%", progress.RidesUntilNextTier, progress.NextKeepRate*100)
+	return progress, nil
+}
+
+func (r *Repository) GetDriverRewardNotifications(ctx context.Context, driverID uuid.UUID, limit int) ([]RewardNotification, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT id, type, title, body, COALESCE(data, '{}'::jsonb), is_read, created_at
+		FROM notifications
+		WHERE user_id = $1 AND type IN ('keep_rate_progress', 'keep_rate_unlocked')
+		ORDER BY created_at DESC
+		LIMIT $2`, driverID, limit)
+	if err != nil {
+		return nil, common.NewInternalError("failed to get reward notifications", err)
+	}
+	defer rows.Close()
+	notifications := make([]RewardNotification, 0)
+	for rows.Next() {
+		var notification RewardNotification
+		if err := rows.Scan(&notification.ID, &notification.Type, &notification.Title,
+			&notification.Body, &notification.Data, &notification.IsRead, &notification.CreatedAt); err != nil {
+			return nil, common.NewInternalError("failed to scan reward notification", err)
+		}
+		notifications = append(notifications, notification)
+	}
+	return notifications, rows.Err()
+}
+
+func (r *Repository) MarkDriverRewardNotificationRead(ctx context.Context, driverID, notificationID uuid.UUID) error {
+	result, err := r.db.Exec(ctx, `
+		UPDATE notifications SET is_read = true, read_at = NOW()
+		WHERE id = $1 AND user_id = $2 AND type IN ('keep_rate_progress', 'keep_rate_unlocked')`,
+		notificationID, driverID)
+	if err != nil {
+		return common.NewInternalError("failed to mark reward notification read", err)
+	}
+	if result.RowsAffected() == 0 {
+		return common.NewNotFoundError("reward notification not found", nil)
+	}
+	return nil
 }
