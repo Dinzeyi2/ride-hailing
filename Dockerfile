@@ -19,11 +19,18 @@ RUN go mod download
 # Copy source code
 COPY . .
 
-# Build argument for service name
-ARG SERVICE_NAME
+# Build argument for service name. Railway does not automatically turn a
+# runtime SERVICE_NAME variable into a Docker build argument, so keep a safe
+# default for auto-detected deployments. Override it with
+# `--build-arg SERVICE_NAME=rides` (or use deploy/railway/<service>/Dockerfile)
+# when building another service.
+ARG SERVICE_NAME=auth
 
-# Build the service
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o /app/service ./cmd/${SERVICE_NAME}
+# Fail with a useful message if a bad service name is supplied, then build it.
+RUN test -n "${SERVICE_NAME}" \
+    && test -f "./cmd/${SERVICE_NAME}/main.go" \
+    || (echo >&2 "Invalid SERVICE_NAME '${SERVICE_NAME}'. Expected a directory under cmd/ (for example: auth, rides, geo, payments, or mobile)."; exit 1)
+RUN CGO_ENABLED=0 GOOS=linux go build -o /app/service "./cmd/${SERVICE_NAME}"
 
 # Final stage
 FROM alpine:latest

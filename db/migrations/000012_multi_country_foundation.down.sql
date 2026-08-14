@@ -77,6 +77,3 @@ DROP TABLE IF EXISTS regions;
 DROP TABLE IF EXISTS countries;
 DROP TABLE IF EXISTS exchange_rates;
 DROP TABLE IF EXISTS currencies;
-
--- Note: We don't drop the postgis extension as other tables might depend on it
--- DROP EXTENSION IF EXISTS postgis;
