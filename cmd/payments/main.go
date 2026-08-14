@@ -134,7 +134,7 @@ func main() {
 	paymentRepo := payments.NewRepository(db)
 	stripeClient := payments.NewResilientStripeClient(stripeAPIKey, stripeBreaker)
 	paymentService := payments.NewService(paymentRepo, stripeClient, &cfg.Business)
-	paymentHandler := payments.NewHandler(paymentService)
+	paymentHandler := payments.NewHandlerWithWebhookSecret(paymentService, os.Getenv("STRIPE_WEBHOOK_SECRET"))
 
 	// Initialize NATS event bus for driver payout on ride completion
 	if cfg.NATS.Enabled && cfg.NATS.URL != "" {

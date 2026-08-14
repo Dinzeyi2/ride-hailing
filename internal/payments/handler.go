@@ -34,10 +34,9 @@ func NewHandler(service *Service) *Handler {
 
 // NewHandlerWithWebhookSecret creates a new handler with Stripe webhook secret for signature verification
 func NewHandlerWithWebhookSecret(service *Service, webhookSecret string) *Handler {
-	return &Handler{
-		service:       service,
-		webhookSecret: webhookSecret,
-	}
+	handler := NewHandler(service)
+	handler.webhookSecret = webhookSecret
+	return handler
 }
 
 // RegisterRoutes registers payment routes
@@ -61,6 +60,9 @@ func (h *Handler) RegisterRoutes(router *gin.Engine, jwtProvider jwtkeys.KeyProv
 		// Driver payout routes
 		protected.GET("/driver/payouts/summary", h.GetPayoutSummary)
 		protected.POST("/driver/payouts/withdraw", h.RequestWithdrawal)
+		protected.GET("/driver/rewards/progress", middleware.RequireRole(models.RoleDriver), h.GetDriverRewardProgress)
+		protected.GET("/driver/rewards/notifications", middleware.RequireRole(models.RoleDriver), h.GetDriverRewardNotifications)
+		protected.POST("/driver/rewards/notifications/:id/read", middleware.RequireRole(models.RoleDriver), h.MarkDriverRewardNotificationRead)
 	}
 
 	// Webhook routes (no auth)
@@ -70,8 +72,55 @@ func (h *Handler) RegisterRoutes(router *gin.Engine, jwtProvider jwtkeys.KeyProv
 // ProcessPaymentRequest represents a payment request
 type ProcessPaymentRequest struct {
 	RideID        string  `json:"ride_id" binding:"required"`
-	Amount        float64 `json:"amount" binding:"required,gt=0"`
+	Amount        float64 `json:"amount" binding:"required,gt=0"` // Compatibility hint only; server replaces it with finalized pricing.
 	PaymentMethod string  `json:"payment_method" binding:"required,oneof=wallet stripe"`
+}
+
+// GetDriverRewardProgress returns the current weekly Fare Keep Rate tracker.
+func (h *Handler) GetDriverRewardProgress(c *gin.Context) {
+	driverID, err := middleware.GetUserID(c)
+	if err != nil {
+		common.ErrorResponse(c, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	progress, err := h.service.GetDriverRewardProgress(c.Request.Context(), driverID)
+	if err != nil {
+		common.ErrorResponse(c, http.StatusInternalServerError, "failed to get reward progress")
+		return
+	}
+	common.SuccessResponse(c, progress)
+}
+
+func (h *Handler) GetDriverRewardNotifications(c *gin.Context) {
+	driverID, err := middleware.GetUserID(c)
+	if err != nil {
+		common.ErrorResponse(c, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	notifications, err := h.service.GetDriverRewardNotifications(c.Request.Context(), driverID, 20)
+	if err != nil {
+		common.ErrorResponse(c, http.StatusInternalServerError, "failed to get reward notifications")
+		return
+	}
+	common.SuccessResponse(c, notifications)
+}
+
+func (h *Handler) MarkDriverRewardNotificationRead(c *gin.Context) {
+	driverID, err := middleware.GetUserID(c)
+	if err != nil {
+		common.ErrorResponse(c, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	notificationID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		common.ErrorResponse(c, http.StatusBadRequest, "invalid notification ID")
+		return
+	}
+	if err := h.service.MarkDriverRewardNotificationRead(c.Request.Context(), driverID, notificationID); err != nil {
+		common.ErrorResponse(c, http.StatusNotFound, "reward notification not found")
+		return
+	}
+	common.SuccessResponse(c, gin.H{"is_read": true})
 }
 
 // TopUpWalletRequest represents a wallet top-up request

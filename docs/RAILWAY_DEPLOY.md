@@ -167,6 +167,32 @@ await fetch(`${API}/rides/api/v1/rides`, {
 Check the deployment with `curl https://your-backend.up.railway.app/healthz`.
 It returns HTTP 200 only when all five processes are healthy.
 
+### Fare Keep Rate and automatic pricing
+
+Every completed ride is automatically assigned a weekly, prospective driver
+commission tier: rides 1–20 keep 80%, 21–40 keep 83%, 41–60 keep 86%, 61–80
+keep 90%, and 81+ keep 93%. The week resets Monday at 00:00 UTC. The applied
+rate, driver payout, and rider price are snapshotted and never retroactively
+recalculated.
+
+Rider total is calculated by the server as the finalized trip value plus a Fare
+service fee of 10%, with a $2.49 minimum and $7.00 maximum. Government fees are
+stored separately and currently default to zero until configured for a market.
+The amount supplied by a frontend payment request is treated only as a legacy
+hint; Stripe and wallet payments use the server snapshot.
+
+Driver applications can display the tracker and in-app milestones through:
+
+```text
+GET  /payments/api/v1/driver/rewards/progress
+GET  /payments/api/v1/driver/rewards/notifications
+POST /payments/api/v1/driver/rewards/notifications/:id/read
+```
+
+Progress notifications are created automatically at 10, 7, 5, 3, and 1 rides
+before the next unlock, plus an unlock notification after rides 20, 40, 60, and
+80. A typical progress response message is `7 more rides until you keep 90%`.
+
 ## Why separate services may still be better later
 
 One service is cheaper and simpler, and is now the recommended MVP setup.
