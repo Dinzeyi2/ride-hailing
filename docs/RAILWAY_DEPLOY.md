@@ -72,17 +72,14 @@ database name is `railway`). Note Redis's `REDISHOST`, `REDISPORT`,
 
 ## 2. Configure variables
 
-Add these to the application service. Migrations run automatically and safely
-at startup, before any API process is launched.
+Railway does not automatically expose one service's variables to another.
+Open the **application service → Variables → Add Reference**, select the
+Postgres service, and add its `DATABASE_URL`. Do not type the literal example
+value as plain text: it must be a Railway variable reference. Migrations run
+automatically at startup, before any API process is launched.
 
 ```dotenv
 DATABASE_URL=${{Postgres.DATABASE_URL}}
-DB_HOST=${{Postgres.PGHOST}}
-DB_PORT=${{Postgres.PGPORT}}
-DB_USER=${{Postgres.PGUSER}}
-DB_PASSWORD=${{Postgres.PGPASSWORD}}
-DB_NAME=${{Postgres.PGDATABASE}}
-DB_SSLMODE=disable
 
 REDIS_HOST=${{Redis.REDISHOST}}
 REDIS_PORT=${{Redis.REDISPORT}}
@@ -94,6 +91,15 @@ CORS_ORIGINS=https://your-app.lovable.app,https://your-preview-domain
 STRIPE_API_KEY=sk_test_...
 STRIPE_WEBHOOK_SECRET=whsec_...
 ```
+
+Only the Postgres `DATABASE_URL` reference is required for database setup; the
+container derives `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, and `DB_NAME`
+for the five Go processes. As an alternative, the startup script also accepts
+individual `PG*` or `DB_*` variables and constructs the migration URL.
+
+If the logs say `PostgreSQL is not linked to this application`, the reference
+is missing from the **application service**, even if the Postgres service itself
+shows a `DATABASE_URL` variable.
 
 Do not set `PORT`; Railway supplies it. Generate a public domain under
 **Settings → Networking**, then deploy.
