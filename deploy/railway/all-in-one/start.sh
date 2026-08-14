@@ -3,6 +3,15 @@ set -eu
 
 : "${JWT_SECRET:?JWT_SECRET must be set to a long random value}"
 
+# Validate the image before touching the database. A historical Docker loop
+# could continue after one go build failed, producing an image without mobile.
+for required_binary in migrate mobile auth rides geo payments railway-gateway; do
+  if [ ! -x "./bin/${required_binary}" ]; then
+    echo "Invalid deployment image: ./bin/${required_binary} is missing or not executable" >&2
+    exit 1
+  fi
+done
+
 # Railway does not automatically share variables between services. Accept its
 # common URL aliases, the PG* variables, or the application's DB_* variables so
 # linking Postgres works without duplicating every field by hand.

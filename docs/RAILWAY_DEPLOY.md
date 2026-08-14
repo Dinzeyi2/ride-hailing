@@ -116,6 +116,15 @@ so could hide a partially applied schema change.
 Do not set `PORT`; Railway supplies it. Generate a public domain under
 **Settings → Networking**, then deploy.
 
+If an older deployment reports `./bin/mobile: not found`, redeploy the latest
+commit with Railway's build cache cleared. The all-in-one Docker build now fails
+immediately if any individual Go binary fails to compile and verifies every
+expected executable before publishing the image. Startup performs the same
+preflight before running migrations. Both `mobile` and `geo` are compiled with
+CGO enabled because the mobile feature API transitively includes the H3 spatial
+library; compiling mobile with `CGO_ENABLED=0` was the reason the old build loop
+silently omitted that binary.
+
 ## 3. Call it from Lovable
 
 Set one frontend variable:
