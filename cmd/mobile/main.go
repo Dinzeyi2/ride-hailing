@@ -41,8 +41,8 @@ import (
 	"github.com/richxcame/ride-hailing/internal/ratings"
 	"github.com/richxcame/ride-hailing/internal/recording"
 	"github.com/richxcame/ride-hailing/internal/ridehistory"
-	"github.com/richxcame/ride-hailing/internal/ridetypes"
 	"github.com/richxcame/ride-hailing/internal/rides"
+	"github.com/richxcame/ride-hailing/internal/ridetypes"
 	"github.com/richxcame/ride-hailing/internal/safety"
 	"github.com/richxcame/ride-hailing/internal/scheduler"
 	"github.com/richxcame/ride-hailing/internal/scheduling"
@@ -60,6 +60,7 @@ import (
 	"github.com/richxcame/ride-hailing/pkg/middleware"
 	"github.com/richxcame/ride-hailing/pkg/ratelimit"
 	redisclient "github.com/richxcame/ride-hailing/pkg/redis"
+	"github.com/richxcame/ride-hailing/pkg/storage"
 	"github.com/richxcame/ride-hailing/pkg/swagger"
 	"github.com/richxcame/ride-hailing/pkg/tracing"
 	ws "github.com/richxcame/ride-hailing/pkg/websocket"
@@ -267,8 +268,23 @@ func main() {
 	loyaltyService := loyalty.NewService(loyaltyRepo)
 	poolService := pool.NewService(poolRepo, &stubMapsService{}, pool.DefaultServiceConfig())
 	deliveryService := delivery.NewService(deliveryRepo)
-	recordingService := recording.NewService(recordingRepo, &stubStorage{}, recording.Config{})
-	onboardingService := onboarding.NewService(onboardingRepo, &stubDocumentService{}, nil) // NotificationService is nil-safe
+	objectStorage := storage.Storage(&stubStorage{})
+	if bucket := os.Getenv("S3_BUCKET"); bucket != "" {
+		s3Storage, storageErr := storage.NewS3Storage(rootCtx, storage.S3Config{
+			Bucket: bucket, Region: getEnv("S3_REGION", "auto"), Endpoint: os.Getenv("S3_ENDPOINT"),
+			AccessKey: os.Getenv("S3_ACCESS_KEY_ID"), SecretKey: os.Getenv("S3_SECRET_ACCESS_KEY"), BaseURL: os.Getenv("S3_BASE_URL"),
+		})
+		if storageErr != nil {
+			logger.Fatal("Failed to initialize document storage", zap.Error(storageErr))
+		}
+		objectStorage = s3Storage
+		logger.Info("S3-compatible private document storage enabled")
+	} else if cfg.Server.Environment == "production" {
+		logger.Warn("S3_BUCKET is not set; document uploads and recordings are disabled")
+	}
+	recordingService := recording.NewService(recordingRepo, objectStorage, recording.Config{})
+	onboardingService := onboarding.NewService(onboardingRepo, &onboardingDocumentAdapter{repo: documentsRepo}, nil) // NotificationService is nil-safe
+	onboardingService.SetBackgroundProvider(onboarding.NewBackgroundProvider(os.Getenv("BACKGROUND_CHECK_PROVIDER"), os.Getenv("BACKGROUND_CHECK_API_URL"), os.Getenv("BACKGROUND_CHECK_API_KEY"), os.Getenv("BACKGROUND_CHECK_WEBHOOK_SECRET")))
 	demandforecastService := demandforecast.NewService(demandforecastRepo, nil, nil, nil) // All deps are nil-safe
 	experimentsService := experiments.NewService(experimentsRepo)
 	fraudService := fraud.NewService(fraudRepo)
@@ -310,11 +326,21 @@ func main() {
 	safetyService := safety.NewService(safetyRepo, safety.Config{
 		EmergencyNumber: getEnv("EMERGENCY_NUMBER", "112"),
 	})
-	documentsService := documents.NewService(documentsRepo, &stubStorage{}, documents.ServiceConfig{
+	documentsService := documents.NewService(documentsRepo, objectStorage, documents.ServiceConfig{
 		MaxFileSizeMB:    10,
 		AllowedMimeTypes: []string{"image/jpeg", "image/png", "application/pdf"},
 		OCREnabled:       false,
 	})
+	go func() {
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for {
+			if _, err := documentsService.ProcessDocumentExpirations(context.Background()); err != nil {
+				logger.Error("document expiration processing failed", zap.Error(err))
+			}
+			<-ticker.C
+		}
+	}()
 	schedulingService := scheduling.NewService(schedulingRepo, &schedulingPricingAdapter{svc: pricingService})
 
 	// Initialize handlers
@@ -353,7 +379,7 @@ func main() {
 	negotiationHandler := negotiation.NewHandler(negotiationService)
 	rideTypesHandler := ridetypes.NewHandler(rideTypesService)
 	safetyHandler := safety.NewHandler(safetyService)
-	documentsHandler := documents.NewHandler(documentsService, &stubDriverService{})
+	documentsHandler := documents.NewHandler(documentsService, &databaseDriverService{db: db})
 	schedulingHandler := scheduling.NewHandler(schedulingService)
 
 	// Set up Gin router
@@ -464,6 +490,7 @@ func main() {
 	fraudHandler.RegisterRoutes(router, jwtProvider)
 	gamificationHandler.RegisterRoutes(router, jwtProvider)
 	paymentsplitHandler.RegisterRoutes(router, jwtProvider)
+	documentsHandler.RegisterRoutes(router, jwtProvider)
 
 	// Register RouterGroup-based routes
 	apiGroup := router.Group("/api/v1")
@@ -474,7 +501,6 @@ func main() {
 	negotiationHandler.RegisterRoutes(apiGroup)
 	rideTypesHandler.RegisterRoutes(apiGroup)
 	safetyHandler.RegisterRoutes(apiGroup)
-	documentsHandler.RegisterRoutesOnGroup(apiGroup)
 	schedulingHandler.RegisterRoutesOnGroup(apiGroup)
 
 	// Start scheduler worker (background: processes scheduled rides, expires stale rides, refreshes analytics)

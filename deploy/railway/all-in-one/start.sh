@@ -5,7 +5,7 @@ set -eu
 
 # Validate the image before touching the database. A historical Docker loop
 # could continue after one go build failed, producing an image without mobile.
-for required_binary in migrate mobile auth rides geo payments railway-gateway; do
+for required_binary in migrate mobile auth rides geo payments notifications realtime railway-gateway; do
   if [ ! -x "./bin/${required_binary}" ]; then
     echo "Invalid deployment image: ./bin/${required_binary} is missing or not executable" >&2
     exit 1
@@ -62,6 +62,11 @@ export REDIS_PORT="${REDIS_PORT:-${REDISPORT:-6379}}"
 export REDIS_PASSWORD="${REDIS_PASSWORD:-${REDISPASSWORD:-}}"
 export REDIS_DB="${REDIS_DB:-0}"
 
+# Authenticate rides -> geo dispatch calls. Since all processes share this
+# container, generate an ephemeral secret when the operator did not provide one.
+export INTERNAL_SERVICE_TOKEN="${INTERNAL_SERVICE_TOKEN:-$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')}"
+export INTERNAL_API_KEY="${INTERNAL_API_KEY:-$INTERNAL_SERVICE_TOKEN}"
+
 # The all-in-one image does not run an OpenTelemetry collector. A stale local
 # endpoint only creates noisy exporter errors, so disable it. Remote collectors
 # remain supported and schemeless endpoints are normalized for the OTLP client.
@@ -100,6 +105,7 @@ fi
 export PROMOS_SERVICE_URL="${PROMOS_SERVICE_URL:-http://127.0.0.1:9089}"
 export GEO_SERVICE_URL="${GEO_SERVICE_URL:-http://127.0.0.1:9083}"
 export NOTIFICATIONS_SERVICE_URL="${NOTIFICATIONS_SERVICE_URL:-http://127.0.0.1:9085}"
+export REALTIME_SERVICE_URL="${REALTIME_SERVICE_URL:-http://127.0.0.1:9086}"
 
 pids=""
 start_service() {
@@ -123,6 +129,8 @@ start_service mobile 9087
 start_service rides 9082
 start_service geo 9083
 start_service payments 9084
+start_service notifications 9085
+start_service realtime 9086
 
 echo "Starting public API gateway on Railway PORT ${PORT:-8080}..."
 ./bin/railway-gateway &

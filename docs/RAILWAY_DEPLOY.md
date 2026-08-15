@@ -11,13 +11,15 @@ Lovable.dev app can call one public HTTPS domain. The repository's
 | `rides`    | 8082 | Ride lifecycle, driver matching, surge pricing |
 | `geo`      | 8083 | Driver location tracking / geospatial queries |
 | `payments` | 8084 | Stripe charges, wallets, payouts |
+| `notifications` | 8085 | Firebase push delivery, device tokens, in-app notifications |
+| `realtime` | 8086 | Authenticated WebSocket ride offers and live trip updates |
 
 The `mobile` process already contains most extended product modules, including
 ratings, scheduling, safety, documents, support, chat, loyalty, pooling,
 delivery, corporate rides, fraud and pricing. Deliberately **not** started as
 separate processes in the one-service deployment:
 Kong, Istio, NATS, Prometheus/Grafana, self-hosted Sentry, MinIO, and the
-remaining 9 microservices (`notifications`, `realtime`, `admin`, `promos`,
+remaining microservices (`admin`, `promos`,
 `scheduler`, `analytics`, `fraud`, `ml-eta`, `negotiation`). None of the core
 5 services require any of them to start — `NATS_ENABLED` defaults to `false`
 and the code just logs a warning and disables async events when it's off.
@@ -41,7 +43,8 @@ separate-service deployment topologies work:
 ## Recommended: one Railway application service
 
 You do **not** have to create five Railway application services for an MVP.
-`deploy/railway/all-in-one/Dockerfile` builds the five core binaries and a small
+`deploy/railway/all-in-one/Dockerfile` builds the core API binaries plus
+notifications and realtime, and a small
 gateway. They run in one container on private loopback ports, while the gateway
 listens on Railway's public `PORT` and exposes these stable prefixes:
 
@@ -52,6 +55,8 @@ listens on Railway's public `PORT` and exposes these stable prefixes:
 | `/rides` | Ride lifecycle | `POST /rides/api/v1/rides` |
 | `/geo` | Driver location | `POST /geo/api/v1/geo/location` |
 | `/payments` | Payments | `GET /payments/api/v1/wallet` |
+| `/notifications` | Notifications | `POST /notifications/api/v1/notifications/devices` |
+| `/realtime` | Realtime | `GET /realtime/api/v1/ws?token=<JWT>` |
 
 The prefix is removed before the request reaches its service. This gives the
 frontend one base URL without changing the existing APIs.
@@ -92,11 +97,49 @@ JWT_SECRET=<one-long-random-secret>
 CORS_ORIGINS=https://your-app.lovable.app,https://your-preview-domain
 STRIPE_API_KEY=sk_test_...
 STRIPE_WEBHOOK_SECRET=whsec_...
+STRIPE_CONNECT_REFRESH_URL=https://your-app.lovable.app/driver/payouts/refresh
+STRIPE_CONNECT_RETURN_URL=https://your-app.lovable.app/driver/payouts/complete
+
+# Driver push notifications (Firebase service-account JSON, kept secret)
+FIREBASE_CREDENTIALS_JSON=<single-line-service-account-json>
+
+# Background-check vendor adapter
+BACKGROUND_CHECK_PROVIDER=<provider-name>
+BACKGROUND_CHECK_API_URL=https://provider.example.com/v1/checks
+BACKGROUND_CHECK_API_KEY=<provider-api-key>
+BACKGROUND_CHECK_WEBHOOK_SECRET=<long-random-webhook-secret>
+
+# Required to enable private driver document uploads (AWS S3 or Cloudflare R2)
+S3_BUCKET=<private-bucket-name>
+S3_REGION=auto
+S3_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com
+S3_ACCESS_KEY_ID=<storage-access-key>
+S3_SECRET_ACCESS_KEY=<storage-secret-key>
+S3_BASE_URL=<optional-private-CDN-base-url>
 ```
 
 `STRIPE_API_KEY` is optional for initial health checks and non-Stripe wallet
 routes. Without it, the Payments API remains online but Stripe charge, refund,
 and payout operations are disabled until a real key is added.
+
+`S3_BUCKET` and its credentials enable the existing presigned document-upload
+workflow. Keep the bucket private. If they are absent, the service starts but
+document and recording uploads deliberately return `storage not configured`.
+The all-in-one launcher generates `INTERNAL_SERVICE_TOKEN` automatically for
+authenticated rides-to-geo dispatch calls; separate-service deployments must
+set the same long random value on both services.
+
+The all-in-one image also runs the notifications and realtime processes. Driver
+apps register an FCM token with `POST /notifications/api/v1/notifications/devices`
+and connect to `wss://YOUR_DOMAIN/realtime/api/v1/ws?token=JWT`. A ride offer is
+stored first, then delivered over WebSocket and queued for Firebase; polling
+`GET /rides/api/v1/driver/rides/available` remains the recovery path.
+
+Background checks use a vendor-neutral JSON adapter. Configure the four
+`BACKGROUND_CHECK_*` values to match the selected provider and register
+`POST https://YOUR_DOMAIN/mobile/api/v1/webhooks/background-check` as its
+callback. The provider must sign the exact request body with HMAC-SHA256 and
+send the hexadecimal digest in `X-Background-Signature`.
 
 The launcher accepts Railway's native `REDISHOST`/`REDISPORT` references and
 normalizes them to the application's `REDIS_HOST`/`REDIS_PORT` names. The
@@ -106,7 +149,7 @@ tracing is required.
 
 Only the Postgres `DATABASE_URL` reference is required for database setup; the
 container derives `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, and `DB_NAME`
-for the five Go processes. As an alternative, the startup script also accepts
+for the Go processes. As an alternative, the startup script also accepts
 individual `PG*` or `DB_*` variables and constructs the migration URL.
 
 If the logs say `PostgreSQL is not linked to this application`, the reference
@@ -165,7 +208,7 @@ await fetch(`${API}/rides/api/v1/rides`, {
 ```
 
 Check the deployment with `curl https://your-backend.up.railway.app/healthz`.
-It returns HTTP 200 only when all five processes are healthy.
+It returns HTTP 200 only when all seven API processes are healthy.
 
 ### Fare Keep Rate and automatic pricing
 
@@ -198,7 +241,7 @@ before the next unlock, plus an unlock notification after rides 20, 40, 60, and
 One service is cheaper and simpler, and is now the recommended MVP setup.
 Separate Railway services provide independent scaling, deploys, logs, crash
 isolation and resource limits. In the all-in-one container, one deployment
-contains five database pools and a restart affects every API. Move to the
+contains several database pools and a restart affects every API. Move to the
 separate layout when traffic or team size makes those trade-offs worthwhile.
 
 ## Alternative: five independently scalable Railway services

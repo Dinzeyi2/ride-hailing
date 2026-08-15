@@ -2,6 +2,7 @@ package onboarding
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -15,7 +16,7 @@ import (
 type OnboardingStatus string
 
 const (
-	StatusNotStarted       OnboardingStatus = "not_started"
+	StatusNotStarted        OnboardingStatus = "not_started"
 	StatusProfileIncomplete OnboardingStatus = "profile_incomplete"
 	StatusDocumentsPending  OnboardingStatus = "documents_pending"
 	StatusDocumentsReview   OnboardingStatus = "documents_under_review"
@@ -28,13 +29,13 @@ const (
 
 // OnboardingStep represents a step in the onboarding process
 type OnboardingStep struct {
-	ID          string           `json:"id"`
-	Name        string           `json:"name"`
-	Description string           `json:"description"`
-	Status      string           `json:"status"` // pending, in_progress, completed, failed
-	Required    bool             `json:"required"`
-	Order       int              `json:"order"`
-	CompletedAt *time.Time       `json:"completed_at,omitempty"`
+	ID          string                 `json:"id"`
+	Name        string                 `json:"name"`
+	Description string                 `json:"description"`
+	Status      string                 `json:"status"` // pending, in_progress, completed, failed
+	Required    bool                   `json:"required"`
+	Order       int                    `json:"order"`
+	CompletedAt *time.Time             `json:"completed_at,omitempty"`
 	Metadata    map[string]interface{} `json:"metadata,omitempty"`
 }
 
@@ -83,6 +84,108 @@ type Service struct {
 	repo            RepositoryInterface
 	documentService DocumentServiceInterface
 	notifService    NotificationServiceInterface
+	background      *BackgroundProvider
+}
+
+func (s *Service) SetBackgroundProvider(provider *BackgroundProvider) { s.background = provider }
+
+type backgroundRepository interface {
+	SetBackgroundProviderReference(context.Context, uuid.UUID, string) error
+	ApplyBackgroundWebhook(context.Context, string, BackgroundWebhook, []byte) (bool, error)
+}
+type onboardingAuditRepository interface {
+	RecordDriverAudit(context.Context, uuid.UUID, uuid.UUID, string, uuid.UUID, map[string]interface{}) error
+}
+
+func (s *Service) ApproveDriver(ctx context.Context, driverID, actorID uuid.UUID) error {
+	driver, err := s.repo.GetDriver(ctx, driverID)
+	if err != nil {
+		return common.NewNotFoundError("driver not found", err)
+	}
+	if ok, err := s.repo.HasApprovedVehicle(ctx, driver.UserID); err != nil || !ok {
+		return common.NewBadRequestError("driver has no approved active vehicle", err)
+	}
+	verification, err := s.documentService.GetDriverVerificationStatus(ctx, driverID)
+	if err != nil || verification.Status != "approved" {
+		return common.NewBadRequestError("driver documents are not approved", err)
+	}
+	background, err := s.repo.GetBackgroundCheck(ctx, driverID)
+	if err != nil || background.Status != "passed" {
+		return common.NewBadRequestError("driver background check has not passed", err)
+	}
+	if err := s.repo.ApproveDriver(ctx, driverID, actorID); err != nil {
+		return err
+	}
+	if audit, ok := s.repo.(onboardingAuditRepository); ok {
+		_ = audit.RecordDriverAudit(ctx, actorID, driver.UserID, "approve_driver", driverID, map[string]interface{}{})
+	}
+	return nil
+}
+func (s *Service) RejectDriver(ctx context.Context, driverID, actorID uuid.UUID, reason string) error {
+	driver, err := s.repo.GetDriver(ctx, driverID)
+	if err != nil {
+		return common.NewNotFoundError("driver not found", err)
+	}
+	if reason == "" {
+		return common.NewBadRequestError("rejection reason is required", nil)
+	}
+	if err := s.repo.RejectDriver(ctx, driverID, actorID, reason); err != nil {
+		return err
+	}
+	if audit, ok := s.repo.(onboardingAuditRepository); ok {
+		_ = audit.RecordDriverAudit(ctx, actorID, driver.UserID, "reject_driver", driverID, map[string]interface{}{"reason": reason})
+	}
+	return nil
+}
+
+func (s *Service) StartBackgroundCheck(ctx context.Context, driverID uuid.UUID) (*BackgroundCheck, error) {
+	if s.background == nil || !s.background.Configured() {
+		return nil, common.NewInternalServerError("background check provider is not configured")
+	}
+	driver, err := s.repo.GetDriver(ctx, driverID)
+	if err != nil {
+		return nil, common.NewNotFoundError("driver not found", err)
+	}
+	check, err := s.repo.CreateBackgroundCheck(ctx, driverID, s.background.Name())
+	if err != nil {
+		return nil, err
+	}
+	result, err := s.background.Start(ctx, driver)
+	if err != nil {
+		notes := err.Error()
+		_ = s.repo.UpdateBackgroundCheckStatus(ctx, check.ID, "failed", &notes)
+		return nil, err
+	}
+	repo, ok := s.repo.(backgroundRepository)
+	if !ok {
+		return nil, common.NewInternalServerError("background provider repository is not configured")
+	}
+	if err := repo.SetBackgroundProviderReference(ctx, check.ID, result.ReferenceID); err != nil {
+		return nil, err
+	}
+	check.Status = "in_progress"
+	return check, nil
+}
+
+func (s *Service) HandleBackgroundWebhook(ctx context.Context, payload []byte, signature string) (bool, error) {
+	if s.background == nil || !s.background.Configured() {
+		return false, common.NewInternalServerError("background check provider is not configured")
+	}
+	if !s.background.Verify(payload, signature) {
+		return false, common.NewBadRequestError("invalid background webhook signature", nil)
+	}
+	event := BackgroundWebhook{}
+	if err := json.Unmarshal(payload, &event); err != nil {
+		return false, common.NewBadRequestError("invalid background webhook payload", err)
+	}
+	if event.EventID == "" || event.ReferenceID == "" {
+		return false, common.NewBadRequestError("event_id and reference_id are required", nil)
+	}
+	repo, ok := s.repo.(backgroundRepository)
+	if !ok {
+		return false, common.NewInternalServerError("background provider repository is not configured")
+	}
+	return repo.ApplyBackgroundWebhook(ctx, s.background.Name(), event, payload)
 }
 
 // DocumentServiceInterface defines methods needed from document service
@@ -94,13 +197,13 @@ type DocumentServiceInterface interface {
 
 // DocumentInfo represents document information
 type DocumentInfo struct {
-	ID             uuid.UUID  `json:"id"`
-	DocumentTypeID uuid.UUID  `json:"document_type_id"`
-	Status         string     `json:"status"`
-	SubmittedAt    time.Time  `json:"submitted_at"`
-	ReviewedAt     *time.Time `json:"reviewed_at,omitempty"`
-	ExpiryDate     *time.Time `json:"expiry_date,omitempty"`
-	RejectionReason *string   `json:"rejection_reason,omitempty"`
+	ID              uuid.UUID  `json:"id"`
+	DocumentTypeID  uuid.UUID  `json:"document_type_id"`
+	Status          string     `json:"status"`
+	SubmittedAt     time.Time  `json:"submitted_at"`
+	ReviewedAt      *time.Time `json:"reviewed_at,omitempty"`
+	ExpiryDate      *time.Time `json:"expiry_date,omitempty"`
+	RejectionReason *string    `json:"rejection_reason,omitempty"`
 }
 
 // DocumentTypeInfo represents document type information
@@ -113,12 +216,12 @@ type DocumentTypeInfo struct {
 
 // VerificationStatus represents driver verification status
 type VerificationStatus struct {
-	Status             string `json:"status"`
-	CanDrive           bool   `json:"can_drive"`
-	MissingDocuments   int    `json:"missing_documents"`
-	PendingDocuments   int    `json:"pending_documents"`
-	ApprovedDocuments  int    `json:"approved_documents"`
-	RejectedDocuments  int    `json:"rejected_documents"`
+	Status            string `json:"status"`
+	CanDrive          bool   `json:"can_drive"`
+	MissingDocuments  int    `json:"missing_documents"`
+	PendingDocuments  int    `json:"pending_documents"`
+	ApprovedDocuments int    `json:"approved_documents"`
+	RejectedDocuments int    `json:"rejected_documents"`
 }
 
 // NotificationServiceInterface defines methods needed from notification service

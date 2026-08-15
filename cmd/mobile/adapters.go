@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/richxcame/ride-hailing/internal/documents"
 	"github.com/richxcame/ride-hailing/internal/onboarding"
 	"github.com/richxcame/ride-hailing/internal/pool"
 	"github.com/richxcame/ride-hailing/internal/pricing"
@@ -64,27 +66,40 @@ func (s *stubStorage) GetPresignedDownloadURL(_ context.Context, key string, _ t
 }
 
 func (s *stubStorage) Exists(_ context.Context, _ string) (bool, error) { return false, nil }
-func (s *stubStorage) Copy(_ context.Context, _, _ string) error        { return fmt.Errorf("storage not configured") }
-
-// ---- Onboarding DocumentService stub ----
-
-type stubDocumentService struct{}
-
-func (s *stubDocumentService) GetDriverDocuments(_ context.Context, driverID uuid.UUID) ([]onboarding.DocumentInfo, error) {
-	logger.Warn("stubDocumentService.GetDriverDocuments called — wire a real DocumentService",
-		zap.String("driver_id", driverID.String()))
-	return []onboarding.DocumentInfo{}, nil
+func (s *stubStorage) Copy(_ context.Context, _, _ string) error {
+	return fmt.Errorf("storage not configured")
 }
 
-func (s *stubDocumentService) GetRequiredDocumentTypes(_ context.Context) ([]onboarding.DocumentTypeInfo, error) {
-	logger.Warn("stubDocumentService.GetRequiredDocumentTypes called — wire a real DocumentService")
-	return []onboarding.DocumentTypeInfo{}, nil
-}
+type onboardingDocumentAdapter struct{ repo *documents.Repository }
 
-func (s *stubDocumentService) GetDriverVerificationStatus(_ context.Context, driverID uuid.UUID) (*onboarding.VerificationStatus, error) {
-	logger.Warn("stubDocumentService.GetDriverVerificationStatus called — wire a real DocumentService",
-		zap.String("driver_id", driverID.String()))
-	return &onboarding.VerificationStatus{Status: "unknown"}, nil
+func (a *onboardingDocumentAdapter) GetDriverDocuments(ctx context.Context, driverID uuid.UUID) ([]onboarding.DocumentInfo, error) {
+	docs, err := a.repo.GetDriverDocuments(ctx, driverID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]onboarding.DocumentInfo, 0, len(docs))
+	for _, d := range docs {
+		out = append(out, onboarding.DocumentInfo{ID: d.ID, DocumentTypeID: d.DocumentTypeID, Status: string(d.Status), SubmittedAt: d.SubmittedAt, ReviewedAt: d.ReviewedAt, ExpiryDate: d.ExpiryDate, RejectionReason: d.RejectionReason})
+	}
+	return out, nil
+}
+func (a *onboardingDocumentAdapter) GetRequiredDocumentTypes(ctx context.Context) ([]onboarding.DocumentTypeInfo, error) {
+	types, err := a.repo.GetRequiredDocumentTypes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]onboarding.DocumentTypeInfo, 0, len(types))
+	for _, t := range types {
+		out = append(out, onboarding.DocumentTypeInfo{ID: t.ID, Code: t.Code, Name: t.Name, IsRequired: t.IsRequired})
+	}
+	return out, nil
+}
+func (a *onboardingDocumentAdapter) GetDriverVerificationStatus(ctx context.Context, driverID uuid.UUID) (*onboarding.VerificationStatus, error) {
+	status, err := a.repo.GetDriverVerificationStatus(ctx, driverID)
+	if err != nil {
+		return nil, err
+	}
+	return &onboarding.VerificationStatus{Status: string(status.VerificationStatus), CanDrive: status.VerificationStatus == documents.VerificationApproved, MissingDocuments: status.RequiredDocumentsCount - status.SubmittedDocumentsCount, PendingDocuments: status.SubmittedDocumentsCount - status.ApprovedDocumentsCount, ApprovedDocuments: status.ApprovedDocumentsCount}, nil
 }
 
 // ---- PaymentSplit PaymentService stub ----
@@ -148,14 +163,12 @@ func (s *stubSMSSender) SendOTP(to, otp string) (string, error) {
 // demandforecast service nil-guards both weatherSvc and driverSvc, so nil is safe.
 // No stubs needed.
 
-// ---- Documents DriverService stub ----
+type databaseDriverService struct{ db *pgxpool.Pool }
 
-type stubDriverService struct{}
-
-func (s *stubDriverService) GetDriverByUserID(_ context.Context, userID uuid.UUID) (*models.Driver, error) {
-	logger.Warn("stubDriverService.GetDriverByUserID called — documents handler doesn't need this for driver endpoints",
-		zap.String("user_id", userID.String()))
-	return nil, fmt.Errorf("driver service not configured for documents")
+func (s *databaseDriverService) GetDriverByUserID(ctx context.Context, userID uuid.UUID) (*models.Driver, error) {
+	d := &models.Driver{}
+	err := s.db.QueryRow(ctx, `SELECT id,user_id,license_number,vehicle_model,vehicle_plate,vehicle_color,vehicle_year,is_available,is_online,COALESCE(approval_status,'pending'),approved_by,approved_at,rejection_reason,rejected_at,rating,total_rides,current_latitude,current_longitude,last_location_update,created_at,updated_at FROM drivers WHERE user_id=$1`, userID).Scan(&d.ID, &d.UserID, &d.LicenseNumber, &d.VehicleModel, &d.VehiclePlate, &d.VehicleColor, &d.VehicleYear, &d.IsAvailable, &d.IsOnline, &d.ApprovalStatus, &d.ApprovedBy, &d.ApprovedAt, &d.RejectionReason, &d.RejectedAt, &d.Rating, &d.TotalRides, &d.CurrentLatitude, &d.CurrentLongitude, &d.LastLocationUpdate, &d.CreatedAt, &d.UpdatedAt)
+	return d, err
 }
 
 // ---- Scheduling PricingService adapter ----

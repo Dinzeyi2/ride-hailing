@@ -257,10 +257,31 @@ func (r *Repository) ScheduleNotificationRetry(ctx context.Context, id uuid.UUID
 
 // GetUserDeviceTokens retrieves FCM device tokens for a user
 func (r *Repository) GetUserDeviceTokens(ctx context.Context, userID uuid.UUID) ([]string, error) {
-	// This would typically come from a device_tokens table
-	// For now, we'll return an empty slice and implement this later
-	// when we add a proper device registration system
-	return []string{}, nil
+	rows, err := r.db.Query(ctx, `SELECT token FROM user_device_tokens WHERE user_id=$1 AND is_active=true ORDER BY last_seen_at DESC`, userID)
+	if err != nil {
+		return nil, common.NewInternalError("failed to get device tokens", err)
+	}
+	defer rows.Close()
+	tokens := make([]string, 0)
+	for rows.Next() {
+		var token string
+		if err := rows.Scan(&token); err != nil {
+			return nil, err
+		}
+		tokens = append(tokens, token)
+	}
+	return tokens, rows.Err()
+}
+
+func (r *Repository) RegisterDeviceToken(ctx context.Context, userID uuid.UUID, token, platform string) error {
+	_, err := r.db.Exec(ctx, `INSERT INTO user_device_tokens(user_id,token,platform) VALUES($1,$2,$3)
+		ON CONFLICT(token) DO UPDATE SET user_id=EXCLUDED.user_id,platform=EXCLUDED.platform,is_active=true,last_seen_at=NOW()`, userID, token, platform)
+	return err
+}
+
+func (r *Repository) RemoveDeviceToken(ctx context.Context, userID uuid.UUID, token string) error {
+	_, err := r.db.Exec(ctx, `UPDATE user_device_tokens SET is_active=false WHERE user_id=$1 AND token=$2`, userID, token)
+	return err
 }
 
 // GetUserPhoneNumber retrieves user's phone number for SMS

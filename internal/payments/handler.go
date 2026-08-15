@@ -21,7 +21,10 @@ type Handler struct {
 	service       *Service
 	adminRepo     AdminRepositoryInterface
 	webhookSecret string
+	connect       *ConnectService
 }
+
+func (h *Handler) SetConnectService(connect *ConnectService) { h.connect = connect }
 
 func NewHandler(service *Service) *Handler {
 	// Try to use the service repo as admin repo if it supports admin methods
@@ -60,13 +63,139 @@ func (h *Handler) RegisterRoutes(router *gin.Engine, jwtProvider jwtkeys.KeyProv
 		// Driver payout routes
 		protected.GET("/driver/payouts/summary", h.GetPayoutSummary)
 		protected.POST("/driver/payouts/withdraw", h.RequestWithdrawal)
+		protected.GET("/driver/payouts/history", middleware.RequireRole(models.RoleDriver), h.GetPayoutHistory)
+		protected.POST("/driver/connect/account", middleware.RequireRole(models.RoleDriver), h.CreateConnectAccount)
+		protected.POST("/driver/connect/onboarding-link", middleware.RequireRole(models.RoleDriver), h.CreateConnectOnboardingLink)
+		protected.GET("/driver/connect/status", middleware.RequireRole(models.RoleDriver), h.GetConnectStatus)
 		protected.GET("/driver/rewards/progress", middleware.RequireRole(models.RoleDriver), h.GetDriverRewardProgress)
 		protected.GET("/driver/rewards/notifications", middleware.RequireRole(models.RoleDriver), h.GetDriverRewardNotifications)
 		protected.POST("/driver/rewards/notifications/:id/read", middleware.RequireRole(models.RoleDriver), h.MarkDriverRewardNotificationRead)
 	}
+	admin := api.Group("/admin")
+	admin.Use(middleware.AuthMiddlewareWithProvider(jwtProvider), middleware.RequireRole(models.RoleAdmin))
+	admin.POST("/payouts/reconcile", h.ReconcilePayouts)
+	admin.GET("/payouts", h.AdminPayoutHistory)
+	admin.POST("/payouts/:id/retry", h.AdminRetryPayout)
 
 	// Webhook routes (no auth)
 	api.POST("/webhooks/stripe", h.HandleStripeWebhook)
+}
+
+func (h *Handler) CreateConnectAccount(c *gin.Context) {
+	if h.connect == nil {
+		common.ErrorResponse(c, http.StatusServiceUnavailable, "Stripe Connect is not configured")
+		return
+	}
+	driverID, err := middleware.GetUserID(c)
+	if err != nil {
+		common.ErrorResponse(c, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	var req struct {
+		Country string `json:"country" binding:"required,len=2"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ErrorResponse(c, http.StatusBadRequest, "country must be a two-letter code")
+		return
+	}
+	status, err := h.connect.EnsureAccount(c.Request.Context(), driverID, req.Country)
+	if err != nil {
+		common.ErrorResponse(c, http.StatusBadGateway, err.Error())
+		return
+	}
+	common.SuccessResponse(c, status)
+}
+
+func (h *Handler) CreateConnectOnboardingLink(c *gin.Context) {
+	if h.connect == nil {
+		common.ErrorResponse(c, http.StatusServiceUnavailable, "Stripe Connect is not configured")
+		return
+	}
+	driverID, err := middleware.GetUserID(c)
+	if err != nil {
+		common.ErrorResponse(c, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	url, err := h.connect.CreateOnboardingLink(c.Request.Context(), driverID)
+	if err != nil {
+		common.ErrorResponse(c, http.StatusBadGateway, err.Error())
+		return
+	}
+	common.SuccessResponse(c, gin.H{"url": url})
+}
+
+func (h *Handler) GetConnectStatus(c *gin.Context) {
+	if h.connect == nil {
+		common.ErrorResponse(c, http.StatusServiceUnavailable, "Stripe Connect is not configured")
+		return
+	}
+	driverID, err := middleware.GetUserID(c)
+	if err != nil {
+		common.ErrorResponse(c, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	status, err := h.connect.Status(c.Request.Context(), driverID)
+	if err != nil {
+		common.ErrorResponse(c, http.StatusNotFound, "Stripe Connect account not found")
+		return
+	}
+	common.SuccessResponse(c, status)
+}
+
+func (h *Handler) GetPayoutHistory(c *gin.Context) {
+	if h.connect == nil {
+		common.ErrorResponse(c, http.StatusServiceUnavailable, "Stripe Connect is not configured")
+		return
+	}
+	driverID, err := middleware.GetUserID(c)
+	if err != nil {
+		common.ErrorResponse(c, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	items, err := h.connect.PayoutHistory(c.Request.Context(), driverID, 50)
+	if err != nil {
+		common.ErrorResponse(c, http.StatusInternalServerError, "failed to get payout history")
+		return
+	}
+	common.SuccessResponse(c, items)
+}
+func (h *Handler) ReconcilePayouts(c *gin.Context) {
+	if h.connect == nil {
+		common.ErrorResponse(c, http.StatusServiceUnavailable, "Stripe Connect is not configured")
+		return
+	}
+	count, err := h.connect.ReconcilePayouts(c.Request.Context())
+	if err != nil {
+		common.ErrorResponse(c, http.StatusBadGateway, "payout reconciliation failed")
+		return
+	}
+	common.SuccessResponse(c, gin.H{"reconciled": count})
+}
+func (h *Handler) AdminPayoutHistory(c *gin.Context) {
+	items, err := h.connect.AdminPayoutHistory(c.Request.Context(), 100)
+	if err != nil {
+		common.ErrorResponse(c, http.StatusInternalServerError, "failed to list payouts")
+		return
+	}
+	common.SuccessResponse(c, items)
+}
+func (h *Handler) AdminRetryPayout(c *gin.Context) {
+	actor, err := middleware.GetUserID(c)
+	if err != nil {
+		common.ErrorResponse(c, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		common.ErrorResponse(c, http.StatusBadRequest, "invalid payout ID")
+		return
+	}
+	payout, err := h.connect.RetryPayout(c.Request.Context(), actor, id)
+	if err != nil {
+		common.ErrorResponse(c, http.StatusConflict, err.Error())
+		return
+	}
+	common.SuccessResponse(c, payout)
 }
 
 // ProcessPaymentRequest represents a payment request
@@ -434,7 +563,13 @@ func (h *Handler) HandleStripeWebhook(c *gin.Context) {
 		}
 	}
 
-	err = h.service.HandleStripeWebhook(c.Request.Context(), eventType, paymentIntentID)
+	if eventType == "account.updated" && h.connect != nil {
+		err = h.connect.RefreshByAccountID(c.Request.Context(), paymentIntentID)
+	} else if (eventType == "transfer.created" || eventType == "transfer.failed" || eventType == "transfer.reversed") && h.connect != nil {
+		err = h.connect.MarkTransferEvent(c.Request.Context(), paymentIntentID, eventType)
+	} else {
+		err = h.service.HandleStripeWebhook(c.Request.Context(), eventType, paymentIntentID)
+	}
 	if err != nil {
 		logger.Get().Error("Failed to handle webhook event",
 			zap.String("event_type", eventType),
@@ -595,17 +730,16 @@ func (h *Handler) RequestWithdrawal(c *gin.Context) {
 		return
 	}
 
-	if err := h.service.RequestWithdrawal(c.Request.Context(), userID, req.Amount); err != nil {
-		appErr, ok := err.(*common.AppError)
-		if ok {
-			common.ErrorResponse(c, appErr.Code, appErr.Message)
-			return
-		}
-		common.ErrorResponse(c, http.StatusInternalServerError, "failed to process withdrawal")
+	if h.connect == nil {
+		common.ErrorResponse(c, http.StatusServiceUnavailable, "Stripe Connect is not configured")
 		return
 	}
-
-	common.SuccessResponseWithStatus(c, http.StatusOK, nil, "Withdrawal request submitted")
+	payout, err := h.connect.RequestPayout(c.Request.Context(), userID, req.Amount, "usd")
+	if err != nil {
+		common.ErrorResponse(c, http.StatusBadGateway, err.Error())
+		return
+	}
+	common.SuccessResponseWithStatus(c, http.StatusOK, payout, "Withdrawal sent to Stripe Connect")
 }
 
 // RegisterAdminRoutes registers only admin payment routes on an existing router group.

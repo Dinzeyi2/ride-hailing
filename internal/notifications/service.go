@@ -9,6 +9,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/google/uuid"
+	"github.com/richxcame/ride-hailing/pkg/common"
 	"github.com/richxcame/ride-hailing/pkg/i18n"
 	"github.com/richxcame/ride-hailing/pkg/logger"
 	"github.com/richxcame/ride-hailing/pkg/models"
@@ -53,6 +54,27 @@ func (s *Service) SetCircuitBreakers(firebaseBreaker, twilioBreaker, emailBreake
 	s.firebaseBreaker = firebaseBreaker
 	s.twilioBreaker = twilioBreaker
 	s.emailBreaker = emailBreaker
+}
+
+type deviceTokenRepository interface {
+	RegisterDeviceToken(context.Context, uuid.UUID, string, string) error
+	RemoveDeviceToken(context.Context, uuid.UUID, string) error
+}
+
+func (s *Service) RegisterDeviceToken(ctx context.Context, userID uuid.UUID, token, platform string) error {
+	repo, ok := s.repo.(deviceTokenRepository)
+	if !ok {
+		return common.NewInternalServerError("device token storage is not configured")
+	}
+	return repo.RegisterDeviceToken(ctx, userID, token, platform)
+}
+
+func (s *Service) RemoveDeviceToken(ctx context.Context, userID uuid.UUID, token string) error {
+	repo, ok := s.repo.(deviceTokenRepository)
+	if !ok {
+		return common.NewInternalServerError("device token storage is not configured")
+	}
+	return repo.RemoveDeviceToken(ctx, userID, token)
 }
 
 // SendNotification sends a notification through the specified channel

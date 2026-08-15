@@ -25,6 +25,8 @@ var services = []struct {
 	{name: "rides", prefix: "/rides", target: "http://127.0.0.1:9082"},
 	{name: "geo", prefix: "/geo", target: "http://127.0.0.1:9083"},
 	{name: "payments", prefix: "/payments", target: "http://127.0.0.1:9084"},
+	{name: "notifications", prefix: "/notifications", target: "http://127.0.0.1:9085"},
+	{name: "realtime", prefix: "/realtime", target: "http://127.0.0.1:9086"},
 }
 
 func main() {
@@ -69,7 +71,7 @@ func index(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"name":     "ride-hailing-api",
 		"status":   "running",
-		"services": []string{"auth", "mobile", "rides", "geo", "payments"},
+		"services": []string{"auth", "mobile", "rides", "geo", "payments", "notifications", "realtime"},
 	})
 }
 

@@ -15,9 +15,16 @@ import (
 // GeoMatchingProvider implements DriverDataProvider by calling the geo service
 // for nearby drivers and the local DB for driver stats.
 type GeoMatchingProvider struct {
-	geoClient *httpclient.Client
-	repo      *Repository
-	breaker   *resilience.CircuitBreaker
+	geoClient     *httpclient.Client
+	repo          *Repository
+	breaker       *resilience.CircuitBreaker
+	internalToken string
+}
+
+func (p *GeoMatchingProvider) SetInternalToken(token string) { p.internalToken = token }
+func (p *GeoMatchingProvider) SetDriverStatus(ctx context.Context, driverID uuid.UUID, status string) error {
+	_, err := p.geoClient.Post(ctx, fmt.Sprintf("/api/v1/internal/geo/drivers/%s/status", driverID), map[string]string{"status": status}, map[string]string{"X-Internal-Service-Token": p.internalToken})
+	return err
 }
 
 // NewGeoMatchingProvider creates a provider backed by the geo service + rides DB.
@@ -48,14 +55,15 @@ type geoAPIResponse struct {
 // then enriches them with DB stats (rating, acceptance rate, idle time).
 func (p *GeoMatchingProvider) GetNearbyDriverCandidates(ctx context.Context, latitude, longitude float64, maxDistance float64, limit int) ([]*DriverCandidate, error) {
 	// Call geo service for nearby drivers (with circuit breaker if configured)
-	path := fmt.Sprintf("/api/v1/geo/drivers/nearby?latitude=%f&longitude=%f&limit=%d", latitude, longitude, limit)
+	path := fmt.Sprintf("/api/v1/internal/geo/drivers/nearby?latitude=%f&longitude=%f&limit=%d", latitude, longitude, limit)
+	headers := map[string]string{"X-Internal-Service-Token": p.internalToken}
 
 	var body []byte
 	var err error
 
 	if p.breaker != nil {
 		result, cbErr := p.breaker.Execute(ctx, func(ctx context.Context) (interface{}, error) {
-			return p.geoClient.Get(ctx, path, nil)
+			return p.geoClient.Get(ctx, path, headers)
 		})
 		if cbErr != nil {
 			logger.WarnContext(ctx, "geo service call failed (circuit breaker)", zap.Error(cbErr))
@@ -63,7 +71,7 @@ func (p *GeoMatchingProvider) GetNearbyDriverCandidates(ctx context.Context, lat
 		}
 		body = result.([]byte)
 	} else {
-		body, err = p.geoClient.Get(ctx, path, nil)
+		body, err = p.geoClient.Get(ctx, path, headers)
 		if err != nil {
 			logger.WarnContext(ctx, "failed to fetch nearby drivers from geo service", zap.Error(err))
 			return []*DriverCandidate{}, nil

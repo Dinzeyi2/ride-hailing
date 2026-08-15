@@ -34,6 +34,8 @@ func (h *Handler) RegisterRoutes(router *gin.Engine, jwtProvider jwtkeys.KeyProv
 		protected.POST("/notifications/:id/read", h.MarkAsRead)
 		protected.POST("/notifications/send", h.SendNotification)
 		protected.POST("/notifications/schedule", h.ScheduleNotification)
+		protected.POST("/notifications/devices", h.RegisterDevice)
+		protected.DELETE("/notifications/devices", h.RemoveDevice)
 
 		// Ride-specific notifications (called by rides service)
 		protected.POST("/notifications/ride/requested", h.NotifyRideRequested)
@@ -50,6 +52,47 @@ func (h *Handler) RegisterRoutes(router *gin.Engine, jwtProvider jwtkeys.KeyProv
 	{
 		admin.POST("/notifications/bulk", h.SendBulkNotification)
 	}
+}
+
+func (h *Handler) RegisterDevice(c *gin.Context) {
+	userID, err := middleware.GetUserID(c)
+	if err != nil {
+		common.ErrorResponse(c, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	var req struct {
+		Token    string `json:"token" binding:"required"`
+		Platform string `json:"platform" binding:"required,oneof=ios android web"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ErrorResponse(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := h.service.RegisterDeviceToken(c.Request.Context(), userID, req.Token, req.Platform); err != nil {
+		common.ErrorResponse(c, http.StatusInternalServerError, "failed to register device")
+		return
+	}
+	common.SuccessResponse(c, gin.H{"registered": true})
+}
+
+func (h *Handler) RemoveDevice(c *gin.Context) {
+	userID, err := middleware.GetUserID(c)
+	if err != nil {
+		common.ErrorResponse(c, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	var req struct {
+		Token string `json:"token" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ErrorResponse(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := h.service.RemoveDeviceToken(c.Request.Context(), userID, req.Token); err != nil {
+		common.ErrorResponse(c, http.StatusInternalServerError, "failed to remove device")
+		return
+	}
+	common.SuccessResponse(c, gin.H{"removed": true})
 }
 
 // SendNotificationRequest represents a notification request

@@ -1,4 +1,4 @@
-# One-domain Railway deployment for the five core APIs. The gateway is the
+# One-domain Railway deployment for the core APIs plus realtime notifications. The gateway is the
 # only public listener; service processes bind to private loopback ports.
 FROM golang:1.24-alpine AS builder
 
@@ -15,11 +15,12 @@ COPY . .
 RUN set -eux; \
     mkdir -p /out; \
     CGO_ENABLED=1 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/mobile ./cmd/mobile; \
-    for service in auth rides payments railway-gateway; do \
+    for service in auth rides payments notifications railway-gateway; do \
       CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o "/out/${service}" "./cmd/${service}" || exit 1; \
     done; \
     CGO_ENABLED=1 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/geo ./cmd/geo; \
-    for service in mobile auth rides geo payments railway-gateway; do test -x "/out/${service}"; done
+    CGO_ENABLED=1 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/realtime ./cmd/realtime; \
+    for service in mobile auth rides geo payments notifications realtime railway-gateway; do test -x "/out/${service}"; done
 RUN GOBIN=/out go install -tags postgres github.com/golang-migrate/migrate/v4/cmd/migrate@v4.17.1
 
 FROM alpine:3.22

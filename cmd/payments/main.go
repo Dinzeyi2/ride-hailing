@@ -135,6 +135,19 @@ func main() {
 	stripeClient := payments.NewResilientStripeClient(stripeAPIKey, stripeBreaker)
 	paymentService := payments.NewService(paymentRepo, stripeClient, &cfg.Business)
 	paymentHandler := payments.NewHandlerWithWebhookSecret(paymentService, os.Getenv("STRIPE_WEBHOOK_SECRET"))
+	connectService := payments.NewConnectService(db, stripeAPIKey, os.Getenv("STRIPE_CONNECT_REFRESH_URL"), os.Getenv("STRIPE_CONNECT_RETURN_URL"))
+	paymentHandler.SetConnectService(connectService)
+	if stripeAPIKey != "" {
+		go func() {
+			ticker := time.NewTicker(time.Hour)
+			defer ticker.Stop()
+			for range ticker.C {
+				if _, err := connectService.ReconcilePayouts(context.Background()); err != nil {
+					logger.Warn("Stripe payout reconciliation failed", zap.Error(err))
+				}
+			}
+		}()
+	}
 
 	// Initialize NATS event bus for driver payout on ride completion
 	if cfg.NATS.Enabled && cfg.NATS.URL != "" {

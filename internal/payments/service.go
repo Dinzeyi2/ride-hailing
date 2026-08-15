@@ -616,6 +616,23 @@ func (s *Service) RequestWithdrawal(ctx context.Context, driverID uuid.UUID, amo
 	return nil
 }
 
+// RollbackWithdrawal compensates a failed external transfer. It is intentionally
+// explicit so a driver is never charged when Stripe rejects the payout.
+func (s *Service) RollbackWithdrawal(ctx context.Context, driverID uuid.UUID, amount float64) error {
+	wallet, err := s.repo.GetWalletByUserID(ctx, driverID)
+	if err != nil {
+		return err
+	}
+	if err := s.repo.UpdateWalletBalance(ctx, wallet.ID, amount); err != nil {
+		return err
+	}
+	return s.repo.CreateWalletTransaction(ctx, &models.WalletTransaction{
+		ID: uuid.New(), WalletID: wallet.ID, Type: "credit", Amount: amount,
+		Description: "Withdrawal reversed after payout provider failure", ReferenceType: "withdrawal_reversal",
+		BalanceBefore: wallet.Balance, BalanceAfter: wallet.Balance + amount, CreatedAt: time.Now(),
+	})
+}
+
 func wrapStripeError(err error, fallbackMessage string) error {
 	if err == nil {
 		return nil

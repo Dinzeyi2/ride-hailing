@@ -15,6 +15,30 @@ type Repository struct {
 	db *pgxpool.Pool
 }
 
+type DriverStatistics struct {
+	OffersReceived  int64   `json:"offers_received"`
+	AcceptedRides   int64   `json:"accepted_rides"`
+	CompletedRides  int64   `json:"completed_rides"`
+	CancelledRides  int64   `json:"cancelled_rides"`
+	AcceptanceRate  float64 `json:"acceptance_rate"`
+	CompletionRate  float64 `json:"completion_rate"`
+	AverageRating   float64 `json:"average_rating"`
+	OnlineMinutes   int64   `json:"online_minutes"`
+	WeeklyEarnings  float64 `json:"weekly_earnings"`
+	WeeklyRides     int     `json:"weekly_rides"`
+	CurrentKeepRate float64 `json:"current_keep_rate"`
+}
+type DispatchOfferAdmin struct {
+	ID         uuid.UUID `json:"id"`
+	RideID     uuid.UUID `json:"ride_id"`
+	DriverID   uuid.UUID `json:"driver_id"`
+	Status     string    `json:"status"`
+	Score      float64   `json:"score"`
+	DistanceKm float64   `json:"distance_km"`
+	OfferedAt  time.Time `json:"offered_at"`
+	ExpiresAt  time.Time `json:"expires_at"`
+}
+
 // NewRepository creates a new rides repository
 func NewRepository(db *pgxpool.Pool) *Repository {
 	return &Repository{db: db}
@@ -194,6 +218,160 @@ func (r *Repository) AtomicAcceptRide(ctx context.Context, rideID, driverID uuid
 		return false, fmt.Errorf("failed to accept ride: %w", err)
 	}
 	return tag.RowsAffected() == 1, nil
+}
+
+func (r *Repository) CreateRideOffers(ctx context.Context, rideID uuid.UUID, candidates []*DriverCandidate, ttl time.Duration) error {
+	if len(candidates) == 0 {
+		return nil
+	}
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin ride offers: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	for _, candidate := range candidates {
+		_, err = tx.Exec(ctx, `INSERT INTO ride_offers (ride_id, driver_id, score, distance_km, expires_at)
+			VALUES ($1,$2,$3,$4,NOW()+$5::interval) ON CONFLICT (ride_id,driver_id) DO NOTHING`,
+			rideID, candidate.DriverID, candidate.Score, candidate.DistanceKm, fmt.Sprintf("%f seconds", ttl.Seconds()))
+		if err != nil {
+			return fmt.Errorf("insert ride offer: %w", err)
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+func (r *Repository) QueueRideOfferNotification(ctx context.Context, rideID, driverID uuid.UUID, data map[string]interface{}) error {
+	_, err := r.db.Exec(ctx, `INSERT INTO notifications(id,user_id,type,channel,title,body,data,status,scheduled_at,created_at,updated_at)
+		VALUES($1,$2,'ride_offer','push','New ride request','A nearby rider is requesting a trip',$3,'pending',NOW(),NOW(),NOW())`,
+		uuid.New(), driverID, data)
+	return err
+}
+
+func (r *Repository) HasActiveOffer(ctx context.Context, rideID, driverID uuid.UUID) (bool, error) {
+	var active bool
+	err := r.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM ride_offers WHERE ride_id=$1 AND driver_id=$2 AND status='offered' AND expires_at>NOW())`, rideID, driverID).Scan(&active)
+	return active, err
+}
+
+func (r *Repository) ResolveRideOffers(ctx context.Context, rideID, acceptedDriverID uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := r.db.Query(ctx, `UPDATE ride_offers SET status=CASE WHEN driver_id=$2 THEN 'accepted' ELSE 'withdrawn' END,responded_at=NOW() WHERE ride_id=$1 AND status='offered' RETURNING driver_id,status`, rideID, acceptedDriverID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	withdrawn := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		var status string
+		if err := rows.Scan(&id, &status); err != nil {
+			return nil, err
+		}
+		if status == "withdrawn" {
+			withdrawn = append(withdrawn, id)
+		}
+	}
+	return withdrawn, rows.Err()
+}
+
+func (r *Repository) GetOfferedRides(ctx context.Context, driverID uuid.UUID) ([]*models.Ride, error) {
+	rows, err := r.db.Query(ctx, `SELECT r.id FROM ride_offers o JOIN rides r ON r.id=o.ride_id
+		WHERE o.driver_id=$1 AND o.status='offered' AND o.expires_at>NOW() AND r.status='requested' ORDER BY o.score DESC,o.offered_at`, driverID)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]uuid.UUID, 0)
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	rides := make([]*models.Ride, 0, len(ids))
+	for _, id := range ids {
+		ride, err := r.GetRideByID(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		rides = append(rides, ride)
+	}
+	return rides, nil
+}
+
+func (r *Repository) GetActiveRideForDriver(ctx context.Context, driverID uuid.UUID) (*models.Ride, error) {
+	var id uuid.UUID
+	err := r.db.QueryRow(ctx, `SELECT id FROM rides WHERE driver_id=$1 AND status IN ('accepted','in_progress') ORDER BY accepted_at DESC LIMIT 1`, driverID).Scan(&id)
+	if err != nil {
+		return nil, err
+	}
+	return r.GetRideByID(ctx, id)
+}
+
+func (r *Repository) GetDriverStatistics(ctx context.Context, driverID uuid.UUID) (*DriverStatistics, error) {
+	s := &DriverStatistics{}
+	err := r.db.QueryRow(ctx, `SELECT
+	(SELECT COUNT(*) FROM ride_offers WHERE driver_id=$1),
+	(SELECT COUNT(*) FROM rides WHERE driver_id=$1 AND status IN ('accepted','in_progress','completed')),
+	(SELECT COUNT(*) FROM rides WHERE driver_id=$1 AND status='completed'),
+	(SELECT COUNT(*) FROM rides WHERE driver_id=$1 AND status='cancelled'),
+	COALESCE((SELECT AVG(rating) FROM rides WHERE driver_id=$1 AND rating IS NOT NULL),0),
+	COALESCE((SELECT SUM(EXTRACT(EPOCH FROM (COALESCE(ended_at,NOW())-started_at))/60)::bigint FROM driver_online_sessions WHERE driver_id=$1),0),
+	COALESCE((SELECT SUM(net_amount) FROM driver_earnings WHERE driver_id=$1 AND created_at>=date_trunc('week',NOW() AT TIME ZONE 'UTC')),0),
+	COALESCE((SELECT completed_rides FROM driver_weekly_rewards WHERE driver_id=$1 AND week_start=date_trunc('week',NOW() AT TIME ZONE 'UTC')::date),0),
+	COALESCE((SELECT current_keep_rate FROM driver_weekly_rewards WHERE driver_id=$1 AND week_start=date_trunc('week',NOW() AT TIME ZONE 'UTC')::date),.80)`, driverID).Scan(&s.OffersReceived, &s.AcceptedRides, &s.CompletedRides, &s.CancelledRides, &s.AverageRating, &s.OnlineMinutes, &s.WeeklyEarnings, &s.WeeklyRides, &s.CurrentKeepRate)
+	if err != nil {
+		return nil, err
+	}
+	if s.OffersReceived > 0 {
+		s.AcceptanceRate = float64(s.AcceptedRides) / float64(s.OffersReceived)
+	}
+	if s.AcceptedRides > 0 {
+		s.CompletionRate = float64(s.CompletedRides) / float64(s.AcceptedRides)
+	}
+	return s, nil
+}
+
+func (r *Repository) ListDispatchOffers(ctx context.Context, limit int) ([]DispatchOfferAdmin, error) {
+	if limit < 1 || limit > 200 {
+		limit = 100
+	}
+	rows, err := r.db.Query(ctx, `SELECT id,ride_id,driver_id,status,COALESCE(score,0),COALESCE(distance_km,0),offered_at,expires_at FROM ride_offers ORDER BY offered_at DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []DispatchOfferAdmin{}
+	for rows.Next() {
+		var x DispatchOfferAdmin
+		if err := rows.Scan(&x.ID, &x.RideID, &x.DriverID, &x.Status, &x.Score, &x.DistanceKm, &x.OfferedAt, &x.ExpiresAt); err != nil {
+			return nil, err
+		}
+		out = append(out, x)
+	}
+	return out, rows.Err()
+}
+func (r *Repository) ExpireDispatchOffer(ctx context.Context, actorID, offerID uuid.UUID) error {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var driverID uuid.UUID
+	err = tx.QueryRow(ctx, `UPDATE ride_offers SET status='expired',responded_at=NOW() WHERE id=$1 AND status='offered' RETURNING driver_id`, offerID).Scan(&driverID)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO driver_operation_audit(actor_id,driver_id,operation,entity_type,entity_id) VALUES($1,$2,'expire_offer','ride_offer',$3)`, actorID, driverID, offerID)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // UpdateRideCompletion updates ride with actual data upon completion

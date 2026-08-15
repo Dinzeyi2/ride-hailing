@@ -1,6 +1,7 @@
 package onboarding
 
 import (
+	"io"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -14,6 +15,34 @@ import (
 // Handler handles HTTP requests for onboarding
 type Handler struct {
 	service *Service
+}
+
+func (h *Handler) StartBackgroundCheck(c *gin.Context) {
+	driverID, err := h.getDriverID(c)
+	if err != nil {
+		common.ErrorResponse(c, http.StatusUnauthorized, "not a registered driver")
+		return
+	}
+	check, err := h.service.StartBackgroundCheck(c.Request.Context(), driverID)
+	if err != nil {
+		common.ErrorResponse(c, http.StatusBadGateway, err.Error())
+		return
+	}
+	common.CreatedResponse(c, check)
+}
+
+func (h *Handler) BackgroundWebhook(c *gin.Context) {
+	payload, err := io.ReadAll(io.LimitReader(c.Request.Body, 1<<20))
+	if err != nil {
+		common.ErrorResponse(c, http.StatusBadRequest, "invalid body")
+		return
+	}
+	processed, err := h.service.HandleBackgroundWebhook(c.Request.Context(), payload, c.GetHeader("X-Background-Signature"))
+	if err != nil {
+		common.ErrorResponse(c, http.StatusUnauthorized, err.Error())
+		return
+	}
+	common.SuccessResponse(c, gin.H{"processed": processed})
 }
 
 // NewHandler creates a new onboarding handler
@@ -100,6 +129,55 @@ func (h *Handler) GetOnboardingStats(c *gin.Context) {
 
 	common.SuccessResponse(c, stats)
 }
+func (h *Handler) ApproveDriver(c *gin.Context) {
+	actor, err := middleware.GetUserID(c)
+	if err != nil {
+		common.ErrorResponse(c, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	driverID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		common.ErrorResponse(c, http.StatusBadRequest, "invalid driver ID")
+		return
+	}
+	if err := h.service.ApproveDriver(c.Request.Context(), driverID, actor); err != nil {
+		if app, ok := err.(*common.AppError); ok {
+			common.AppErrorResponse(c, app)
+			return
+		}
+		common.ErrorResponse(c, http.StatusInternalServerError, "failed to approve driver")
+		return
+	}
+	common.SuccessResponse(c, gin.H{"approved": true})
+}
+func (h *Handler) RejectDriver(c *gin.Context) {
+	actor, err := middleware.GetUserID(c)
+	if err != nil {
+		common.ErrorResponse(c, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	driverID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		common.ErrorResponse(c, http.StatusBadRequest, "invalid driver ID")
+		return
+	}
+	var req struct {
+		Reason string `json:"reason" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ErrorResponse(c, http.StatusBadRequest, "reason is required")
+		return
+	}
+	if err := h.service.RejectDriver(c.Request.Context(), driverID, actor, req.Reason); err != nil {
+		if app, ok := err.(*common.AppError); ok {
+			common.AppErrorResponse(c, app)
+			return
+		}
+		common.ErrorResponse(c, http.StatusInternalServerError, "failed to reject driver")
+		return
+	}
+	common.SuccessResponse(c, gin.H{"rejected": true})
+}
 
 // getDriverID gets the driver ID from the authenticated user
 func (h *Handler) getDriverID(c *gin.Context) (uuid.UUID, error) {
@@ -125,7 +203,9 @@ func (h *Handler) RegisterRoutes(r *gin.Engine, jwtProvider jwtkeys.KeyProvider)
 		onboarding.POST("/start", h.StartOnboarding)
 		onboarding.GET("/progress", h.GetProgress)
 		onboarding.GET("/documents", h.GetDocumentRequirements)
+		onboarding.POST("/background-check", h.StartBackgroundCheck)
 	}
+	r.POST("/api/v1/webhooks/background-check", h.BackgroundWebhook)
 
 	// Admin routes
 	adminOnboarding := r.Group("/api/v1/admin/onboarding")
@@ -133,6 +213,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine, jwtProvider jwtkeys.KeyProvider)
 	adminOnboarding.Use(middleware.RequireRole(models.RoleAdmin))
 	{
 		adminOnboarding.GET("/stats", h.GetOnboardingStats)
+		adminOnboarding.POST("/drivers/:id/approve", h.ApproveDriver)
+		adminOnboarding.POST("/drivers/:id/reject", h.RejectDriver)
 	}
 }
 
