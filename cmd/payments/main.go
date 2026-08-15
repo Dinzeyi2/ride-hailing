@@ -93,7 +93,6 @@ func main() {
 		}
 	}
 
-
 	// Initialize database
 	db, err := database.NewPostgresPool(&cfg.Database, cfg.Timeout.DatabaseQueryTimeout)
 	if err != nil {
@@ -106,7 +105,11 @@ func main() {
 	// Get Stripe API key from configuration / secrets manager
 	stripeAPIKey := cfg.Payments.StripeAPIKey
 	if stripeAPIKey == "" {
-		logger.Fatal("STRIPE_API_KEY is required - set via env var or configure secrets manager")
+		// Wallet reads and non-Stripe endpoints can still operate without Stripe.
+		// Keep the API healthy so an optional provider credential cannot crash the
+		// complete Railway deployment; Stripe operations will return provider errors
+		// until a real key is configured.
+		logger.Warn("STRIPE_API_KEY is not configured - Stripe operations are disabled")
 	}
 
 	var stripeBreaker *resilience.CircuitBreaker
@@ -131,7 +134,20 @@ func main() {
 	paymentRepo := payments.NewRepository(db)
 	stripeClient := payments.NewResilientStripeClient(stripeAPIKey, stripeBreaker)
 	paymentService := payments.NewService(paymentRepo, stripeClient, &cfg.Business)
-	paymentHandler := payments.NewHandler(paymentService)
+	paymentHandler := payments.NewHandlerWithWebhookSecret(paymentService, os.Getenv("STRIPE_WEBHOOK_SECRET"))
+	connectService := payments.NewConnectService(db, stripeAPIKey, os.Getenv("STRIPE_CONNECT_REFRESH_URL"), os.Getenv("STRIPE_CONNECT_RETURN_URL"))
+	paymentHandler.SetConnectService(connectService)
+	if stripeAPIKey != "" {
+		go func() {
+			ticker := time.NewTicker(time.Hour)
+			defer ticker.Stop()
+			for range ticker.C {
+				if _, err := connectService.ReconcilePayouts(context.Background()); err != nil {
+					logger.Warn("Stripe payout reconciliation failed", zap.Error(err))
+				}
+			}
+		}()
+	}
 
 	// Initialize NATS event bus for driver payout on ride completion
 	if cfg.NATS.Enabled && cfg.NATS.URL != "" {

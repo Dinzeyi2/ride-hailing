@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/richxcame/ride-hailing/internal/drivereligibility"
 	"github.com/richxcame/ride-hailing/internal/pricing"
 	"github.com/richxcame/ride-hailing/pkg/common"
 	"github.com/richxcame/ride-hailing/pkg/eventbus"
@@ -53,6 +54,24 @@ type Service struct {
 	pricingService      *pricing.Service
 	locationResolver    LocationResolver
 	rideTypeNameFetcher func(ctx context.Context, id uuid.UUID) (string, error)
+	eligibility         *drivereligibility.Service
+	realtimeClient      *httpclient.Client
+	internalAPIKey      string
+	statusUpdater       interface {
+		SetDriverStatus(context.Context, uuid.UUID, string) error
+	}
+}
+
+func (s *Service) SetDriverStatusUpdater(updater interface {
+	SetDriverStatus(context.Context, uuid.UUID, string) error
+}) { s.statusUpdater = updater }
+
+func (s *Service) SetRealtimeDispatch(client *httpclient.Client, internalAPIKey string) {
+	s.realtimeClient, s.internalAPIKey = client, internalAPIKey
+}
+
+func (s *Service) SetDriverEligibility(eligibility *drivereligibility.Service) {
+	s.eligibility = eligibility
 }
 
 // SurgeCalculator defines the interface for surge pricing calculation
@@ -323,6 +342,20 @@ func (s *Service) RequestRide(ctx context.Context, riderID uuid.UUID, req *model
 		return nil, common.NewInternalServerError("failed to create ride request")
 	}
 
+	// Persist targeted, expiring offers. Polling clients now see only offers
+	// intended for them; realtime delivery can consume the same records later.
+	if s.matcher != nil && !ride.IsScheduled {
+		if candidates, matchErr := s.matcher.FindBestDrivers(ctx, req.PickupLatitude, req.PickupLongitude); matchErr != nil {
+			logger.WarnContext(ctx, "driver matching failed after ride creation", zap.Error(matchErr))
+		} else if candidates = s.filterEligibleCandidates(ctx, candidates); len(candidates) == 0 {
+			logger.InfoContext(ctx, "no currently eligible drivers for ride", zap.String("ride_id", ride.ID.String()))
+		} else if err := s.repo.CreateRideOffers(ctx, ride.ID, candidates, 30*time.Second); err != nil {
+			logger.WarnContext(ctx, "failed to persist ride offers", zap.Error(err))
+		} else {
+			s.dispatchRideOffers(ctx, ride, candidates)
+		}
+	}
+
 	// Add final ride attributes to span
 	tracing.AddSpanAttributes(ctx,
 		tracing.RideIDKey.String(ride.ID.String()),
@@ -392,6 +425,45 @@ func (s *Service) RequestRide(ctx context.Context, riderID uuid.UUID, req *model
 	return ride, nil
 }
 
+func (s *Service) filterEligibleCandidates(ctx context.Context, candidates []*DriverCandidate) []*DriverCandidate {
+	if s.eligibility == nil {
+		return candidates
+	}
+	eligible := make([]*DriverCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		result, err := s.eligibility.Check(ctx, candidate.DriverID)
+		if err == nil && result.Eligible {
+			eligible = append(eligible, candidate)
+		}
+	}
+	return eligible
+}
+
+func (s *Service) dispatchRideOffers(ctx context.Context, ride *models.Ride, candidates []*DriverCandidate) {
+	expiresAt := time.Now().Add(30 * time.Second)
+	for _, candidate := range candidates {
+		data := map[string]interface{}{
+			"ride_id": ride.ID, "pickup_latitude": ride.PickupLatitude, "pickup_longitude": ride.PickupLongitude,
+			"pickup_address": ride.PickupAddress, "dropoff_latitude": ride.DropoffLatitude,
+			"dropoff_longitude": ride.DropoffLongitude, "dropoff_address": ride.DropoffAddress,
+			"estimated_fare": ride.EstimatedFare, "estimated_distance": ride.EstimatedDistance,
+			"estimated_duration": ride.EstimatedDuration, "distance_to_pickup": candidate.DistanceKm,
+			"expires_at": expiresAt, "timeout_seconds": 30,
+		}
+		if err := s.repo.QueueRideOfferNotification(ctx, ride.ID, candidate.DriverID, data); err != nil {
+			logger.WarnContext(ctx, "failed to queue ride offer push", zap.Error(err))
+		}
+		if s.realtimeClient != nil {
+			_, err := s.realtimeClient.Post(ctx, "/api/v1/internal/broadcast/user", map[string]interface{}{
+				"user_id": candidate.DriverID.String(), "type": "ride.offer", "data": data,
+			}, map[string]string{"X-Internal-API-Key": s.internalAPIKey})
+			if err != nil {
+				logger.WarnContext(ctx, "realtime ride offer delivery failed; polling remains available", zap.Error(err))
+			}
+		}
+	}
+}
+
 // GetRide retrieves a ride by ID
 func (s *Service) GetRide(ctx context.Context, rideID uuid.UUID) (*models.Ride, error) {
 	ride, err := s.repo.GetRideByID(ctx, rideID)
@@ -411,6 +483,20 @@ func (s *Service) AcceptRide(ctx context.Context, rideID, driverID uuid.UUID) (*
 		tracing.RideIDKey.String(rideID.String()),
 		tracing.DriverIDKey.String(driverID.String()),
 	)
+	if s.eligibility != nil {
+		result, err := s.eligibility.Check(ctx, driverID)
+		if err != nil {
+			return nil, common.NewInternalServerError("failed to verify driver eligibility")
+		}
+		if !result.Eligible {
+			return nil, common.NewErrorWithCode(403, "DRIVER_NOT_ELIGIBLE", result.Message(), nil)
+		}
+	}
+	if offered, err := s.repo.HasActiveOffer(ctx, rideID, driverID); err != nil {
+		return nil, common.NewInternalServerError("failed to verify ride offer")
+	} else if !offered {
+		return nil, common.NewErrorWithCode(409, common.ErrCodeRideNotAvailable, "ride was not offered to this driver or the offer expired", nil)
+	}
 
 	// Atomic accept: single UPDATE with status guard prevents double-accept race condition
 	accepted, err := s.repo.AtomicAcceptRide(ctx, rideID, driverID)
@@ -421,6 +507,13 @@ func (s *Service) AcceptRide(ctx context.Context, rideID, driverID uuid.UUID) (*
 	if !accepted {
 		return nil, common.NewErrorWithCode(409, common.ErrCodeRideNotAvailable,
 			"ride is no longer available for acceptance", nil)
+	}
+	withdrawn, _ := s.repo.ResolveRideOffers(ctx, rideID, driverID)
+	if s.statusUpdater != nil {
+		_ = s.statusUpdater.SetDriverStatus(ctx, driverID, "busy")
+	}
+	for _, otherDriver := range withdrawn {
+		s.broadcastToDriver(ctx, otherDriver, "ride.offer.withdrawn", map[string]interface{}{"ride_id": rideID, "reason": "accepted_by_another_driver"})
 	}
 
 	// Re-fetch ride with updated fields
@@ -563,6 +656,11 @@ func (s *Service) CompleteRide(ctx context.Context, rideID, driverID uuid.UUID, 
 	ride.FinalFare = &finalFare
 	now := time.Now()
 	ride.CompletedAt = &now
+	if s.statusUpdater != nil {
+		if err := s.statusUpdater.SetDriverStatus(ctx, driverID, "available"); err != nil {
+			_ = s.statusUpdater.SetDriverStatus(ctx, driverID, "offline")
+		}
+	}
 
 	currency := ride.CurrencyCode
 	if currency == "" {
@@ -581,6 +679,16 @@ func (s *Service) CompleteRide(ctx context.Context, rideID, driverID uuid.UUID, 
 	})
 
 	return ride, nil
+}
+
+func (s *Service) broadcastToDriver(ctx context.Context, driverID uuid.UUID, messageType string, data map[string]interface{}) {
+	if s.realtimeClient == nil {
+		return
+	}
+	_, err := s.realtimeClient.Post(ctx, "/api/v1/internal/broadcast/user", map[string]interface{}{"user_id": driverID.String(), "type": messageType, "data": data}, map[string]string{"X-Internal-API-Key": s.internalAPIKey})
+	if err != nil {
+		logger.WarnContext(ctx, "driver realtime broadcast failed", zap.Error(err))
+	}
 }
 
 // CancelRide cancels a ride
@@ -614,6 +722,11 @@ func (s *Service) CancelRide(ctx context.Context, rideID, userID uuid.UUID, reas
 	cancelledBy := "rider"
 	if isDriver {
 		cancelledBy = "driver"
+		if s.statusUpdater != nil {
+			if err := s.statusUpdater.SetDriverStatus(ctx, userID, "available"); err != nil {
+				_ = s.statusUpdater.SetDriverStatus(ctx, userID, "offline")
+			}
+		}
 	}
 	driverID := uuid.Nil
 	if ride.DriverID != nil {
@@ -678,13 +791,36 @@ func (s *Service) GetDriverRides(ctx context.Context, driverID uuid.UUID, filter
 }
 
 // GetAvailableRides retrieves all available ride requests
-func (s *Service) GetAvailableRides(ctx context.Context) ([]*models.Ride, error) {
-	rides, err := s.repo.GetPendingRides(ctx)
+func (s *Service) GetAvailableRidesForDriver(ctx context.Context, driverID uuid.UUID) ([]*models.Ride, error) {
+	rides, err := s.repo.GetOfferedRides(ctx, driverID)
 	if err != nil {
 		return nil, common.NewInternalServerError("failed to get available rides")
 	}
 
 	return rides, nil
+}
+
+// GetAvailableRides is retained for internal compatibility. Public driver
+// clients use GetAvailableRidesForDriver so offers cannot leak across drivers.
+func (s *Service) GetAvailableRides(ctx context.Context) ([]*models.Ride, error) {
+	return s.repo.GetPendingRides(ctx)
+}
+
+func (s *Service) GetActiveDriverRide(ctx context.Context, driverID uuid.UUID) (*models.Ride, error) {
+	ride, err := s.repo.GetActiveRideForDriver(ctx, driverID)
+	if err != nil {
+		return nil, common.NewNotFoundError("no active ride", nil)
+	}
+	return ride, nil
+}
+func (s *Service) GetDriverStatistics(ctx context.Context, driverID uuid.UUID) (*DriverStatistics, error) {
+	return s.repo.GetDriverStatistics(ctx, driverID)
+}
+func (s *Service) ListDispatchOffers(ctx context.Context, limit int) ([]DispatchOfferAdmin, error) {
+	return s.repo.ListDispatchOffers(ctx, limit)
+}
+func (s *Service) ExpireDispatchOffer(ctx context.Context, actorID, offerID uuid.UUID) error {
+	return s.repo.ExpireDispatchOffer(ctx, actorID, offerID)
 }
 
 // Helper functions

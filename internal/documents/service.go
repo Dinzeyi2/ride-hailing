@@ -534,6 +534,18 @@ func (s *Service) GetExpiringDocuments(ctx context.Context, daysAhead int) ([]*E
 	return s.repo.GetExpiringDocuments(ctx, daysAhead)
 }
 
+type expirationProcessor interface {
+	ProcessDocumentExpirations(context.Context) (int64, error)
+}
+
+func (s *Service) ProcessDocumentExpirations(ctx context.Context) (int64, error) {
+	repo, ok := s.repo.(expirationProcessor)
+	if !ok {
+		return 0, common.NewInternalServerError("document expiration processor is not configured")
+	}
+	return repo.ProcessDocumentExpirations(ctx)
+}
+
 // StartReview marks a document as under review
 func (s *Service) StartReview(ctx context.Context, documentID uuid.UUID, reviewerID uuid.UUID) error {
 	doc, err := s.repo.GetDocument(ctx, documentID)

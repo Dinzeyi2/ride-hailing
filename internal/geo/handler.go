@@ -1,7 +1,9 @@
 package geo
 
 import (
+	"crypto/subtle"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 
@@ -15,8 +17,8 @@ import (
 
 // Handler handles HTTP requests for geolocation
 type Handler struct {
-	service    *Service
-	geocoding  *GeocodingService
+	service   *Service
+	geocoding *GeocodingService
 }
 
 // NewHandler creates a new geo handler
@@ -113,9 +115,9 @@ func (h *Handler) FindNearbyDrivers(c *gin.Context) {
 	}
 
 	common.SuccessResponse(c, gin.H{
-		"drivers":  drivers,
-		"h3_cell":  GetMatchingCell(latitude, longitude),
-		"surge":    GetSurgeZone(latitude, longitude),
+		"drivers": drivers,
+		"h3_cell": GetMatchingCell(latitude, longitude),
+		"surge":   GetSurgeZone(latitude, longitude),
 	})
 }
 
@@ -137,10 +139,10 @@ func (h *Handler) CalculateDistance(c *gin.Context) {
 	eta := h.service.CalculateETA(distance)
 
 	common.SuccessResponse(c, gin.H{
-		"distance_km":    distance,
-		"eta_minutes":    eta,
-		"from_h3_cell":  GetMatchingCell(req.FromLatitude, req.FromLongitude),
-		"to_h3_cell":    GetMatchingCell(req.ToLatitude, req.ToLongitude),
+		"distance_km":     distance,
+		"eta_minutes":     eta,
+		"from_h3_cell":    GetMatchingCell(req.FromLatitude, req.FromLongitude),
+		"to_h3_cell":      GetMatchingCell(req.ToLatitude, req.ToLongitude),
 		"from_surge_zone": GetSurgeZone(req.FromLatitude, req.FromLongitude),
 		"to_surge_zone":   GetSurgeZone(req.ToLatitude, req.ToLongitude),
 	})
@@ -520,4 +522,37 @@ func (h *Handler) RegisterRoutes(r *gin.Engine, jwtProvider jwtkeys.KeyProvider)
 		internal.POST("/register", h.RegisterActiveRide)
 		internal.POST("/unregister", h.UnregisterActiveRide)
 	}
+
+	// Matching is service-to-service only; never expose live driver locations
+	// without either a user JWT or the shared internal token.
+	internalGeo := r.Group("/api/v1/internal/geo")
+	internalGeo.Use(func(c *gin.Context) {
+		expected := os.Getenv("INTERNAL_SERVICE_TOKEN")
+		provided := c.GetHeader("X-Internal-Service-Token")
+		if expected == "" || subtle.ConstantTimeCompare([]byte(expected), []byte(provided)) != 1 {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid internal service token"})
+			return
+		}
+		c.Next()
+	})
+	internalGeo.GET("/drivers/nearby", h.FindNearbyDrivers)
+	internalGeo.POST("/drivers/:id/status", func(c *gin.Context) {
+		id, err := uuid.Parse(c.Param("id"))
+		if err != nil {
+			common.ErrorResponse(c, http.StatusBadRequest, "invalid driver ID")
+			return
+		}
+		var req struct {
+			Status string `json:"status" binding:"required,oneof=available busy offline"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			common.ErrorResponse(c, http.StatusBadRequest, "invalid status")
+			return
+		}
+		if err := h.service.SetDriverStatus(c.Request.Context(), id, req.Status); err != nil {
+			common.ErrorResponse(c, http.StatusConflict, err.Error())
+			return
+		}
+		common.SuccessResponse(c, gin.H{"status": req.Status})
+	})
 }

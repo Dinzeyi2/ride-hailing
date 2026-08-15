@@ -13,14 +13,15 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/google/uuid"
+	"github.com/richxcame/ride-hailing/internal/drivereligibility"
 	"github.com/richxcame/ride-hailing/internal/pricing"
 	"github.com/richxcame/ride-hailing/internal/rides"
 	"github.com/richxcame/ride-hailing/internal/ridetypes"
 	"github.com/richxcame/ride-hailing/pkg/common"
 	"github.com/richxcame/ride-hailing/pkg/config"
-	"github.com/richxcame/ride-hailing/pkg/eventbus"
 	"github.com/richxcame/ride-hailing/pkg/database"
 	"github.com/richxcame/ride-hailing/pkg/errors"
+	"github.com/richxcame/ride-hailing/pkg/eventbus"
 	"github.com/richxcame/ride-hailing/pkg/httpclient"
 	"github.com/richxcame/ride-hailing/pkg/jwtkeys"
 	"github.com/richxcame/ride-hailing/pkg/logger"
@@ -192,6 +193,7 @@ func main() {
 	}
 	geoClient := httpclient.NewClient(geoServiceURL)
 	matchingProvider := rides.NewGeoMatchingProvider(geoClient, repo)
+	matchingProvider.SetInternalToken(os.Getenv("INTERNAL_SERVICE_TOKEN"))
 	if cfg.Resilience.CircuitBreaker.Enabled {
 		cbCfg := cfg.Resilience.CircuitBreaker.SettingsFor("geo-service")
 		geoBreaker := resilience.NewCircuitBreaker(
@@ -202,6 +204,13 @@ func main() {
 	}
 	matcher := rides.NewMatcher(rides.DefaultMatchingConfig(), matchingProvider)
 	service.SetMatcher(matcher)
+	service.SetDriverStatusUpdater(matchingProvider)
+	service.SetDriverEligibility(drivereligibility.New(db))
+	realtimeURL := os.Getenv("REALTIME_SERVICE_URL")
+	if realtimeURL == "" {
+		realtimeURL = "http://127.0.0.1:8086"
+	}
+	service.SetRealtimeDispatch(httpclient.NewClient(realtimeURL), os.Getenv("INTERNAL_API_KEY"))
 	logger.Info("Driver-rider matching engine enabled")
 
 	// Wire ride type name fetcher so events carry the real ride type name

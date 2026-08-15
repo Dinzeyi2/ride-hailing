@@ -295,7 +295,12 @@ func (h *Handler) GetMyRides(c *gin.Context) {
 
 // GetAvailableRides lists ride requests that can be accepted by drivers.
 func (h *Handler) GetAvailableRides(c *gin.Context) {
-	rides, err := h.service.GetAvailableRides(c.Request.Context())
+	driverID, err := middleware.GetUserID(c)
+	if err != nil {
+		common.ErrorResponse(c, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	rides, err := h.service.GetAvailableRidesForDriver(c.Request.Context(), driverID)
 	if err != nil {
 		if appErr, ok := err.(*common.AppError); ok {
 			common.AppErrorResponse(c, appErr)
@@ -313,6 +318,62 @@ func (h *Handler) GetAvailableRides(c *gin.Context) {
 	common.SuccessResponse(c, rides)
 }
 
+// GetActiveDriverRide restores the authoritative trip after reconnect/reload.
+func (h *Handler) GetActiveDriverRide(c *gin.Context) {
+	driverID, err := middleware.GetUserID(c)
+	if err != nil {
+		common.ErrorResponse(c, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	ride, err := h.service.GetActiveDriverRide(c.Request.Context(), driverID)
+	if err != nil {
+		if appErr, ok := err.(*common.AppError); ok {
+			common.AppErrorResponse(c, appErr)
+			return
+		}
+		common.ErrorResponse(c, http.StatusInternalServerError, "failed to restore active ride")
+		return
+	}
+	common.SuccessResponse(c, ride)
+}
+func (h *Handler) GetDriverStatistics(c *gin.Context) {
+	driverID, err := middleware.GetUserID(c)
+	if err != nil {
+		common.ErrorResponse(c, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	stats, err := h.service.GetDriverStatistics(c.Request.Context(), driverID)
+	if err != nil {
+		common.ErrorResponse(c, http.StatusInternalServerError, "failed to get driver statistics")
+		return
+	}
+	common.SuccessResponse(c, stats)
+}
+func (h *Handler) AdminListDispatchOffers(c *gin.Context) {
+	offers, err := h.service.ListDispatchOffers(c.Request.Context(), 100)
+	if err != nil {
+		common.ErrorResponse(c, http.StatusInternalServerError, "failed to list dispatch offers")
+		return
+	}
+	common.SuccessResponse(c, offers)
+}
+func (h *Handler) AdminExpireDispatchOffer(c *gin.Context) {
+	actor, err := middleware.GetUserID(c)
+	if err != nil {
+		common.ErrorResponse(c, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		common.ErrorResponse(c, http.StatusBadRequest, "invalid offer ID")
+		return
+	}
+	if err := h.service.ExpireDispatchOffer(c.Request.Context(), actor, id); err != nil {
+		common.ErrorResponse(c, http.StatusConflict, "offer is no longer active")
+		return
+	}
+	common.SuccessResponse(c, gin.H{"expired": true})
+}
 
 // GetUserProfile retrieves user profile data
 func (h *Handler) GetUserProfile(c *gin.Context) {
@@ -466,8 +527,14 @@ func (h *Handler) RegisterRoutes(r *gin.Engine, jwtProvider jwtkeys.KeyProvider,
 	drivers.Use(middleware.RequireRole(models.RoleDriver))
 	{
 		drivers.GET("/available", h.GetAvailableRides)
+		drivers.GET("/active", h.GetActiveDriverRide)
+		drivers.GET("/statistics", h.GetDriverStatistics)
 		drivers.POST("/:id/accept", h.AcceptRide)
 		drivers.POST("/:id/start", h.StartRide)
 		drivers.POST("/:id/complete", h.CompleteRide)
 	}
+	admin := api.Group("/admin/dispatch")
+	admin.Use(middleware.RequireRole(models.RoleAdmin))
+	admin.GET("/offers", h.AdminListDispatchOffers)
+	admin.POST("/offers/:id/expire", h.AdminExpireDispatchOffer)
 }

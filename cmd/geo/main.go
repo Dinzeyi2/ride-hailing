@@ -11,9 +11,11 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/richxcame/ride-hailing/internal/drivereligibility"
 	"github.com/richxcame/ride-hailing/internal/geo"
 	"github.com/richxcame/ride-hailing/pkg/common"
 	"github.com/richxcame/ride-hailing/pkg/config"
+	"github.com/richxcame/ride-hailing/pkg/database"
 	"github.com/richxcame/ride-hailing/pkg/errors"
 	"github.com/richxcame/ride-hailing/pkg/jwtkeys"
 	"github.com/richxcame/ride-hailing/pkg/logger"
@@ -98,7 +100,15 @@ func main() {
 	defer redis.Close()
 	logger.Info("Connected to Redis")
 
+	db, err := database.NewPostgresPool(&cfg.Database, cfg.Timeout.DatabaseQueryTimeout)
+	if err != nil {
+		logger.Fatal("Failed to connect to database", zap.Error(err))
+	}
+	defer database.Close(db)
+	logger.Info("Connected to database")
+
 	service := geo.NewService(redis)
+	service.SetDriverEligibility(drivereligibility.New(db))
 
 	// Initialize location batching pipeline
 	locationBuffer := geo.NewLocationBuffer(redis, geo.DefaultLocationBufferConfig())
@@ -182,6 +192,11 @@ func main() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		return redis.Client.Ping(ctx).Err()
+	}
+	healthChecks["database"] = func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		return db.Ping(ctx)
 	}
 
 	router.GET("/health/ready", common.ReadinessProbe(serviceName, version, healthChecks))

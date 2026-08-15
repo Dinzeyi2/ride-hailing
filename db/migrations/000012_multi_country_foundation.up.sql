@@ -1,8 +1,9 @@
 -- Multi-Country Foundation Migration
 -- Enables hierarchical pricing by country → region → city → zone
 
--- Enable PostGIS extension for geospatial boundaries
-CREATE EXTENSION IF NOT EXISTS postgis;
+-- Boundaries are stored as WKT text for compatibility with managed PostgreSQL.
+-- Runtime driver proximity uses Redis; latitude/longitude columns provide the
+-- portable fallback for city and pricing-zone lookup.
 
 -- ========================================
 -- CURRENCIES
@@ -111,7 +112,7 @@ CREATE TABLE cities (
     timezone VARCHAR(50),
     center_latitude DECIMAL(10,8) NOT NULL,
     center_longitude DECIMAL(11,8) NOT NULL,
-    boundary GEOMETRY(POLYGON, 4326),
+    boundary TEXT,
     population INTEGER,
     is_active BOOLEAN NOT NULL DEFAULT false,
     launched_at TIMESTAMPTZ,
@@ -121,7 +122,6 @@ CREATE TABLE cities (
 
 CREATE INDEX idx_cities_region ON cities(region_id);
 CREATE INDEX idx_cities_active ON cities(region_id, is_active) WHERE is_active = true;
-CREATE INDEX idx_cities_boundary ON cities USING GIST(boundary);
 CREATE INDEX idx_cities_center ON cities(center_latitude, center_longitude);
 
 -- Pricing zones (airports, downtown, event venues, borders)
@@ -130,7 +130,7 @@ CREATE TABLE pricing_zones (
     city_id UUID NOT NULL REFERENCES cities(id) ON DELETE CASCADE,
     name VARCHAR(100) NOT NULL,
     zone_type VARCHAR(50) NOT NULL,
-    boundary GEOMETRY(POLYGON, 4326) NOT NULL,
+    boundary TEXT NOT NULL,
     center_latitude DECIMAL(10,8) NOT NULL,
     center_longitude DECIMAL(11,8) NOT NULL,
     priority INTEGER NOT NULL DEFAULT 0,
@@ -144,7 +144,6 @@ COMMENT ON COLUMN pricing_zones.zone_type IS 'airport, downtown, transit_hub, ev
 COMMENT ON COLUMN pricing_zones.priority IS 'Higher priority zones take precedence when overlapping';
 
 CREATE INDEX idx_pricing_zones_city ON pricing_zones(city_id);
-CREATE INDEX idx_pricing_zones_boundary ON pricing_zones USING GIST(boundary);
 CREATE INDEX idx_pricing_zones_type ON pricing_zones(zone_type);
 CREATE INDEX idx_pricing_zones_active ON pricing_zones(city_id, is_active) WHERE is_active = true;
 

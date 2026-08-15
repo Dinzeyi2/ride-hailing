@@ -2,6 +2,8 @@ package onboarding
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -176,8 +178,8 @@ func (r *Repository) CreateBackgroundCheck(ctx context.Context, driverID uuid.UU
 	}
 
 	query := `
-		INSERT INTO driver_background_checks (id, driver_id, status, provider, created_at)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO driver_background_checks (id, driver_id, status, provider, check_type, created_at)
+		VALUES ($1, $2, $3, $4, 'criminal_driving_identity', $5)
 	`
 
 	_, err := r.db.Exec(ctx, query, check.ID, check.DriverID, check.Status, check.Provider, check.CreatedAt)
@@ -186,6 +188,51 @@ func (r *Repository) CreateBackgroundCheck(ctx context.Context, driverID uuid.UU
 	}
 
 	return check, nil
+}
+
+func (r *Repository) SetBackgroundProviderReference(ctx context.Context, checkID uuid.UUID, reference string) error {
+	_, err := r.db.Exec(ctx, `UPDATE driver_background_checks SET provider_reference=$2,status='in_progress',started_at=COALESCE(started_at,NOW()),updated_at=NOW() WHERE id=$1`, checkID, reference)
+	return err
+}
+
+func (r *Repository) ApplyBackgroundWebhook(ctx context.Context, provider string, event BackgroundWebhook, payload []byte) (bool, error) {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+	tag, err := tx.Exec(ctx, `INSERT INTO background_check_webhook_events(provider,event_id,payload) VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, provider, event.EventID, json.RawMessage(payload))
+	if err != nil {
+		return false, err
+	}
+	if tag.RowsAffected() == 0 {
+		return false, tx.Commit(ctx)
+	}
+	status := event.Status
+	if status == "clear" || status == "completed" {
+		status = "passed"
+	}
+	if status == "consider" || status == "adverse_action" {
+		status = "failed"
+	}
+	if status != "pending" && status != "in_progress" && status != "passed" && status != "failed" {
+		return false, fmt.Errorf("unsupported background status %q", status)
+	}
+	var report *string
+	if event.ReportURL != "" {
+		report = &event.ReportURL
+	}
+	var notes *string
+	if event.Notes != "" {
+		notes = &event.Notes
+	}
+	_, err = tx.Exec(ctx, `UPDATE driver_background_checks SET status=$3,report_url=COALESCE($4,report_url),notes=COALESCE($5,notes),raw_result=$6,result=$6,
+		completed_at=CASE WHEN $3 IN ('passed','failed') THEN NOW() ELSE completed_at END,
+		expires_at=CASE WHEN $3='passed' THEN NOW()+INTERVAL '1 year' ELSE expires_at END,updated_at=NOW() WHERE provider=$1 AND provider_reference=$2`, provider, event.ReferenceID, status, report, notes, json.RawMessage(payload))
+	if err != nil {
+		return false, err
+	}
+	return true, tx.Commit(ctx)
 }
 
 // UpdateBackgroundCheckStatus updates background check status
@@ -224,6 +271,11 @@ func (r *Repository) RejectDriver(ctx context.Context, driverID uuid.UUID, rejec
 	`
 
 	_, err := r.db.Exec(ctx, query, reason, driverID)
+	return err
+}
+
+func (r *Repository) RecordDriverAudit(ctx context.Context, actorID, driverUserID uuid.UUID, operation string, entityID uuid.UUID, metadata map[string]interface{}) error {
+	_, err := r.db.Exec(ctx, `INSERT INTO driver_operation_audit(actor_id,driver_id,operation,entity_type,entity_id,metadata) VALUES($1,$2,$3,'driver',$4,$5)`, actorID, driverUserID, operation, entityID, metadata)
 	return err
 }
 

@@ -498,6 +498,51 @@ func (r *Repository) GetExpiringDocuments(ctx context.Context, daysAhead int) ([
 	return expiring, nil
 }
 
+// ProcessDocumentExpirations creates deduplicated reminders, expires documents,
+// and immediately removes affected drivers from durable availability.
+func (r *Repository) ProcessDocumentExpirations(ctx context.Context) (int64, error) {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	_, err = tx.Exec(ctx, `WITH due AS (
+		SELECT dd.id document_id,dd.driver_id,d.user_id,(dd.expiry_date-CURRENT_DATE)::int days_left,
+		CASE WHEN dd.expiry_date<CURRENT_DATE THEN 'expired' WHEN dd.expiry_date<=CURRENT_DATE+INTERVAL '1 day' THEN 'urgent'
+		WHEN dd.expiry_date<=CURRENT_DATE+INTERVAL '7 days' THEN 'reminder_7_days' ELSE 'reminder_30_days' END kind
+		FROM driver_documents dd JOIN drivers d ON d.id=dd.driver_id
+		WHERE dd.status='approved' AND dd.expiry_date<=CURRENT_DATE+INTERVAL '30 days'
+	), inserted AS (
+		INSERT INTO document_expiry_notifications(driver_id,document_id,notification_type,days_until_expiry,sent_via)
+		SELECT driver_id,document_id,kind,days_left,ARRAY['push']::varchar[] FROM due
+		ON CONFLICT(document_id,notification_type) DO NOTHING RETURNING document_id,notification_type,days_until_expiry
+	)
+	INSERT INTO notifications(id,user_id,type,channel,title,body,data,status,scheduled_at,created_at,updated_at)
+	SELECT uuid_generate_v4(),due.user_id,'document_expiry','push',
+		CASE WHEN inserted.notification_type='expired' THEN 'Driver document expired' ELSE 'Driver document expires soon' END,
+		CASE WHEN inserted.notification_type='expired' THEN 'A required document expired. Upload a replacement before going online.'
+		ELSE 'A required driver document expires in '||GREATEST(inserted.days_until_expiry,0)||' days.' END,
+		jsonb_build_object('document_id',due.document_id,'days_until_expiry',inserted.days_until_expiry,'action','replace_document'),
+		'pending',NOW(),NOW(),NOW() FROM inserted JOIN due USING(document_id)`)
+	if err != nil {
+		return 0, err
+	}
+	tag, err := tx.Exec(ctx, `UPDATE driver_documents SET status='expired',updated_at=NOW() WHERE status='approved' AND expiry_date<CURRENT_DATE`)
+	if err != nil {
+		return 0, err
+	}
+	_, err = tx.Exec(ctx, `UPDATE drivers d SET is_online=false,is_available=false,updated_at=NOW() WHERE EXISTS(
+		SELECT 1 FROM driver_documents dd JOIN document_types dt ON dt.id=dd.document_type_id
+		WHERE dd.driver_id=d.id AND dt.is_required=true AND dd.status='expired')`)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
 // ========================================
 // HISTORY
 // ========================================

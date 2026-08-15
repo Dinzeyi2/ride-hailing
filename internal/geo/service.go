@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/richxcame/ride-hailing/internal/drivereligibility"
 	"github.com/richxcame/ride-hailing/pkg/common"
 	pkggeo "github.com/richxcame/ride-hailing/pkg/geo"
 	"github.com/richxcame/ride-hailing/pkg/logger"
@@ -35,10 +36,10 @@ type DriverLocation struct {
 	DriverID  uuid.UUID `json:"driver_id"`
 	Latitude  float64   `json:"latitude"`
 	Longitude float64   `json:"longitude"`
-	H3Cell    string    `json:"h3_cell"`             // H3 cell at matching resolution
-	Heading   float64   `json:"heading,omitempty"`   // Direction the driver is facing (0-360)
-	Speed     float64   `json:"speed,omitempty"`     // Speed in km/h
-	Status    string    `json:"status,omitempty"`    // Driver availability status (available, busy, offline)
+	H3Cell    string    `json:"h3_cell"`           // H3 cell at matching resolution
+	Heading   float64   `json:"heading,omitempty"` // Direction the driver is facing (0-360)
+	Speed     float64   `json:"speed,omitempty"`   // Speed in km/h
+	Status    string    `json:"status,omitempty"`  // Driver availability status (available, busy, offline)
 	Timestamp time.Time `json:"timestamp"`
 }
 
@@ -64,6 +65,11 @@ type Service struct {
 	redis          redisClient.ClientInterface
 	locationBuffer *LocationBuffer
 	etaTracker     *ETATracker
+	eligibility    *drivereligibility.Service
+}
+
+func (s *Service) SetDriverEligibility(eligibility *drivereligibility.Service) {
+	s.eligibility = eligibility
 }
 
 // NewService creates a new geo service
@@ -262,6 +268,17 @@ func (s *Service) FindNearbyDrivers(ctx context.Context, latitude, longitude flo
 
 // SetDriverStatus sets driver's availability status
 func (s *Service) SetDriverStatus(ctx context.Context, driverID uuid.UUID, status string) error {
+	if status == "available" || status == "online" {
+		if s.eligibility != nil {
+			result, err := s.eligibility.Check(ctx, driverID)
+			if err != nil {
+				return common.NewInternalErrorWithError("failed to verify driver eligibility", err)
+			}
+			if !result.Eligible {
+				return common.NewErrorWithCode(403, "DRIVER_NOT_ELIGIBLE", result.Message(), nil)
+			}
+		}
+	}
 	key := fmt.Sprintf("%s%s", driverStatusPrefix, driverID.String())
 	data := map[string]interface{}{
 		"status":    status,
@@ -275,6 +292,14 @@ func (s *Service) SetDriverStatus(ctx context.Context, driverID uuid.UUID, statu
 
 	if err := s.redis.SetWithExpiration(ctx, key, jsonData, driverLocationTTL); err != nil {
 		return common.NewInternalErrorWithError("failed to set driver status", err)
+	}
+	if s.eligibility != nil {
+		if err := s.eligibility.SetAvailability(ctx, driverID, status); err != nil {
+			// Never leave a driver dispatchable in Redis when durable state failed.
+			s.redis.Delete(ctx, key)
+			s.redis.GeoRemove(ctx, driverGeoIndexKey, driverID.String())
+			return common.NewInternalErrorWithError("failed to persist driver availability", err)
+		}
 	}
 
 	// If driver goes offline, remove from all indexes
@@ -591,7 +616,7 @@ func calculateSurgeMultiplier(demand, supply int) float64 {
 
 // DriverSessionSummary represents a driver's session statistics
 type DriverSessionSummary struct {
-	OnlineDurationMinutes int     `json:"online_duration_minutes"`
+	OnlineDurationMinutes int       `json:"online_duration_minutes"`
 	StartedAt             time.Time `json:"started_at"`
 	EndedAt               time.Time `json:"ended_at"`
 }
@@ -599,18 +624,16 @@ type DriverSessionSummary struct {
 // ValidateDriverEligibility checks if a driver can go online
 // This validates document verification, vehicle status, and background checks
 func (s *Service) ValidateDriverEligibility(ctx context.Context, driverID uuid.UUID) error {
-	// TODO: Implement comprehensive eligibility checks:
-	// 1. Check driver document verification status (documents service)
-	// 2. Check vehicle verification status
-	// 3. Check background check status
-	// 4. Check if driver is suspended/banned
-	// 5. Check if driver has active payment method
-
-	// For MVP, allow all drivers to go online
-	// These checks should be implemented in a future iteration
-	logger.DebugContext(ctx, "driver eligibility check passed (MVP mode)",
-		zap.String("driver_id", driverID.String()))
-
+	if s.eligibility == nil {
+		return common.NewInternalServerError("driver eligibility service is not configured")
+	}
+	result, err := s.eligibility.Check(ctx, driverID)
+	if err != nil {
+		return common.NewInternalErrorWithError("failed to verify driver eligibility", err)
+	}
+	if !result.Eligible {
+		return common.NewErrorWithCode(403, "DRIVER_NOT_ELIGIBLE", result.Message(), nil)
+	}
 	return nil
 }
 

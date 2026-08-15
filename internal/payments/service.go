@@ -27,6 +27,48 @@ type Service struct {
 	cancellationFeeRate float64
 }
 
+// RidePricingSnapshot is the server-authoritative price and driver reward
+// snapshot created when a ride is completed.
+type RidePricingSnapshot struct {
+	TripValue        float64 `json:"trip_value"`
+	ServiceFee       float64 `json:"service_fee"`
+	GovernmentFees   float64 `json:"government_fees"`
+	RiderTotal       float64 `json:"rider_total"`
+	CommissionRate   float64 `json:"commission_rate"`
+	CommissionAmount float64 `json:"commission_amount"`
+	DriverKeepRate   float64 `json:"driver_keep_rate"`
+	DriverPayout     float64 `json:"driver_payout"`
+	WeeklyRideNumber int     `json:"weekly_ride_number"`
+}
+
+// DriverRewardProgress is returned to the driver app for the keep-rate tracker.
+type DriverRewardProgress struct {
+	WeekStart             string  `json:"week_start"`
+	CompletedRides        int     `json:"completed_rides"`
+	CurrentCommissionRate float64 `json:"current_commission_rate"`
+	CurrentKeepRate       float64 `json:"current_keep_rate"`
+	NextKeepRate          float64 `json:"next_keep_rate,omitempty"`
+	RidesUntilNextTier    int     `json:"rides_until_next_tier"`
+	Message               string  `json:"message"`
+}
+
+type RewardNotification struct {
+	ID        uuid.UUID              `json:"id"`
+	Type      string                 `json:"type"`
+	Title     string                 `json:"title"`
+	Body      string                 `json:"body"`
+	Data      map[string]interface{} `json:"data"`
+	IsRead    bool                   `json:"is_read"`
+	CreatedAt time.Time              `json:"created_at"`
+}
+
+type rewardsRepository interface {
+	GetRidePricingSnapshot(ctx context.Context, rideID, riderID uuid.UUID) (*RidePricingSnapshot, error)
+	GetDriverRewardProgress(ctx context.Context, driverID uuid.UUID) (*DriverRewardProgress, error)
+	GetDriverRewardNotifications(ctx context.Context, driverID uuid.UUID, limit int) ([]RewardNotification, error)
+	MarkDriverRewardNotificationRead(ctx context.Context, driverID, notificationID uuid.UUID) error
+}
+
 func NewService(repo RepositoryInterface, stripeClient StripeClientInterface, cfg *config.BusinessConfig) *Service {
 	commissionRate := defaultCommissionRate
 	cancellationFeeRate := defaultCancellationFeeRate
@@ -55,6 +97,13 @@ func (s *Service) GetRideDriverID(ctx context.Context, rideID uuid.UUID) (*uuid.
 
 // RecordRideEarning records a ride_fare earning for a driver on ride completion.
 func (s *Service) RecordRideEarning(ctx context.Context, driverID, rideID uuid.UUID, fareAmount float64) error {
+	if rewards, ok := s.repo.(rewardsRepository); ok {
+		if snapshot, err := rewards.GetRidePricingSnapshot(ctx, rideID, uuid.Nil); err == nil {
+			commission := snapshot.CommissionAmount
+			description := fmt.Sprintf("Earnings from ride %s (%.0f%% Fare commission)", rideID, snapshot.CommissionRate*100)
+			return s.repo.RecordRideEarning(ctx, driverID, rideID, snapshot.TripValue, commission, snapshot.DriverPayout, description)
+		}
+	}
 	commission := fareAmount * s.commissionRate
 	netAmount := fareAmount - commission
 	description := fmt.Sprintf("Earnings from ride %s (%.0f%% commission)", rideID, s.commissionRate*100)
@@ -74,6 +123,21 @@ func (s *Service) ProcessRidePayment(ctx context.Context, rideID, riderID, drive
 		Status:        "pending",
 		Metadata:      map[string]interface{}{},
 	}
+	if rewards, ok := s.repo.(rewardsRepository); ok {
+		snapshot, err := rewards.GetRidePricingSnapshot(ctx, rideID, riderID)
+		if err != nil {
+			return nil, common.NewBadRequestError("ride is not completed or has no finalized price", err)
+		}
+		payment.Amount = snapshot.RiderTotal
+		payment.TripValue = snapshot.TripValue
+		payment.ServiceFee = snapshot.ServiceFee
+		payment.GovernmentFees = snapshot.GovernmentFees
+		payment.Commission = snapshot.CommissionAmount
+		payment.CommissionRate = snapshot.CommissionRate
+		payment.DriverEarnings = snapshot.DriverPayout
+		payment.DriverKeepRate = snapshot.DriverKeepRate
+		payment.Metadata["weekly_ride_number"] = snapshot.WeeklyRideNumber
+	}
 
 	switch paymentMethod {
 	case "wallet":
@@ -83,6 +147,34 @@ func (s *Service) ProcessRidePayment(ctx context.Context, rideID, riderID, drive
 	default:
 		return nil, common.NewBadRequestError("invalid payment method", nil)
 	}
+}
+
+// GetDriverRewardProgress returns this week's keep-rate progress.
+func (s *Service) GetDriverRewardProgress(ctx context.Context, driverID uuid.UUID) (*DriverRewardProgress, error) {
+	rewards, ok := s.repo.(rewardsRepository)
+	if !ok {
+		return nil, common.NewInternalServerError("driver rewards are not configured")
+	}
+	return rewards.GetDriverRewardProgress(ctx, driverID)
+}
+
+func (s *Service) GetDriverRewardNotifications(ctx context.Context, driverID uuid.UUID, limit int) ([]RewardNotification, error) {
+	rewards, ok := s.repo.(rewardsRepository)
+	if !ok {
+		return nil, common.NewInternalServerError("driver rewards are not configured")
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	return rewards.GetDriverRewardNotifications(ctx, driverID, limit)
+}
+
+func (s *Service) MarkDriverRewardNotificationRead(ctx context.Context, driverID, notificationID uuid.UUID) error {
+	rewards, ok := s.repo.(rewardsRepository)
+	if !ok {
+		return common.NewInternalServerError("driver rewards are not configured")
+	}
+	return rewards.MarkDriverRewardNotificationRead(ctx, driverID, notificationID)
 }
 
 // processWalletPayment processes payment using wallet balance
@@ -113,9 +205,13 @@ func (s *Service) processStripePayment(ctx context.Context, payment *models.Paym
 
 	// Create payment intent
 	metadata := map[string]string{
-		"ride_id":   payment.RideID.String(),
-		"rider_id":  payment.RiderID.String(),
-		"driver_id": payment.DriverID.String(),
+		"ride_id":         payment.RideID.String(),
+		"rider_id":        payment.RiderID.String(),
+		"driver_id":       payment.DriverID.String(),
+		"trip_value":      fmt.Sprintf("%.2f", payment.TripValue),
+		"service_fee":     fmt.Sprintf("%.2f", payment.ServiceFee),
+		"driver_payout":   fmt.Sprintf("%.2f", payment.DriverEarnings),
+		"commission_rate": fmt.Sprintf("%.4f", payment.CommissionRate),
 	}
 
 	pi, err := s.stripeClient.CreatePaymentIntent(
@@ -518,6 +614,23 @@ func (s *Service) RequestWithdrawal(ctx context.Context, driverID uuid.UUID, amo
 	)
 
 	return nil
+}
+
+// RollbackWithdrawal compensates a failed external transfer. It is intentionally
+// explicit so a driver is never charged when Stripe rejects the payout.
+func (s *Service) RollbackWithdrawal(ctx context.Context, driverID uuid.UUID, amount float64) error {
+	wallet, err := s.repo.GetWalletByUserID(ctx, driverID)
+	if err != nil {
+		return err
+	}
+	if err := s.repo.UpdateWalletBalance(ctx, wallet.ID, amount); err != nil {
+		return err
+	}
+	return s.repo.CreateWalletTransaction(ctx, &models.WalletTransaction{
+		ID: uuid.New(), WalletID: wallet.ID, Type: "credit", Amount: amount,
+		Description: "Withdrawal reversed after payout provider failure", ReferenceType: "withdrawal_reversal",
+		BalanceBefore: wallet.Balance, BalanceAfter: wallet.Balance + amount, CreatedAt: time.Now(),
+	})
 }
 
 func wrapStripeError(err error, fallbackMessage string) error {

@@ -32,6 +32,9 @@ type Payment struct {
 	RiderID         uuid.UUID              `json:"rider_id" db:"rider_id"`
 	DriverID        uuid.UUID              `json:"driver_id" db:"driver_id"`
 	Amount          float64                `json:"amount" db:"amount"`
+	TripValue       float64                `json:"trip_value" db:"trip_value"`
+	ServiceFee      float64                `json:"service_fee" db:"service_fee"`
+	GovernmentFees  float64                `json:"government_fees" db:"government_fees"`
 	Currency        string                 `json:"currency" db:"currency"`
 	PaymentMethod   string                 `json:"payment_method" db:"payment_method"`
 	Status          string                 `json:"status" db:"status"`
@@ -39,7 +42,9 @@ type Payment struct {
 	StripeChargeID  *string                `json:"stripe_charge_id,omitempty" db:"stripe_charge_id"`
 	Metadata        map[string]interface{} `json:"metadata,omitempty" db:"metadata"`
 	Commission      float64                `json:"commission" db:"commission"`
+	CommissionRate  float64                `json:"commission_rate" db:"commission_rate"`
 	DriverEarnings  float64                `json:"driver_earnings" db:"driver_earnings"`
+	DriverKeepRate  float64                `json:"driver_keep_rate" db:"driver_keep_rate"`
 	Method          PaymentMethod          `json:"method" db:"method"`
 	TransactionID   *string                `json:"transaction_id,omitempty" db:"transaction_id"`
 	FailureReason   *string                `json:"failure_reason,omitempty" db:"failure_reason"`

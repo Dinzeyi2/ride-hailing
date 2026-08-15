@@ -14,15 +14,15 @@ import (
 	"github.com/richxcame/ride-hailing/internal/notifications"
 	"github.com/richxcame/ride-hailing/pkg/common"
 	"github.com/richxcame/ride-hailing/pkg/config"
-	"github.com/richxcame/ride-hailing/pkg/eventbus"
 	"github.com/richxcame/ride-hailing/pkg/database"
 	"github.com/richxcame/ride-hailing/pkg/errors"
+	"github.com/richxcame/ride-hailing/pkg/eventbus"
 	"github.com/richxcame/ride-hailing/pkg/jwtkeys"
 	"github.com/richxcame/ride-hailing/pkg/logger"
 	"github.com/richxcame/ride-hailing/pkg/middleware"
-	"github.com/richxcame/ride-hailing/pkg/tracing"
 	"github.com/richxcame/ride-hailing/pkg/resilience"
 	"github.com/richxcame/ride-hailing/pkg/swagger"
+	"github.com/richxcame/ride-hailing/pkg/tracing"
 	"go.uber.org/zap"
 )
 
@@ -91,7 +91,6 @@ func main() {
 			logger.Info("OpenTelemetry tracing initialized successfully")
 		}
 	}
-
 
 	// Initialize database
 	db, err := database.NewPostgresPool(&cfg.Database, cfg.Timeout.DatabaseQueryTimeout)
@@ -190,7 +189,7 @@ func main() {
 
 	// Start background worker for processing scheduled notifications
 	go func() {
-		ticker := time.NewTicker(1 * time.Minute)
+		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 
 		for range ticker.C {
